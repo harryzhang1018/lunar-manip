@@ -1,0 +1,8 @@
+name: chrono
+channels:
+  - projectchrono
+  - conda-forge
+dependencies:
+  - python=3.12
+  - projectchrono::pychrono
+  - scipy   # used by model/inverseKin.py (numpy comes in as a dependency)
