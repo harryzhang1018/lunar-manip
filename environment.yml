@@ -1,4 +1,4 @@
-name: chrono
+name: pychrono
 channels:
   - projectchrono
   - conda-forge

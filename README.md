@@ -7,9 +7,10 @@ back of the chassis**, standing (braked) on flat terrain.
 The demo is a **record/replay** of a rock placement, run as two simulations:
 
 - **Sim 1 (headless):** pick a random target behind the arm (polar: θ∈[90°,270°],
-  r∈[2,3] m, 0.2–0.3 m above ground), drive the end-effector there with inverse
-  kinematics, let it settle, and **record** the four joint angles and the
-  gripper-center position (midpoint of the two fingers' centers of mass).
+  r∈[2,3] m, at the fixed grab height of 0.22 m above ground), drive the
+  end-effector there with inverse kinematics, let it settle, and **record** the
+  four joint angles and the gripper-center position (midpoint of the two
+  fingers' centers of mass).
 - **Sim 2 (visualized):** rebuild the same scene **with a rock placed at the
   recorded gripper-center position** (`build_scene(rock_pos=...)`) and **replay**
   the recorded angles. Recording the *actual* settled pose (vs. the IK target)
@@ -34,6 +35,7 @@ lunar-manip/
 │   └── inverseKin.py       # RobotArmInverseKinematicsSolver
 └── data/
     ├── lrv_robotarm/       # arm SolidWorks export (lrv_arm.py) + mesh shapes
+    ├── rocks/              # rock2.obj (Curiosity rock mesh from chrono's data)
     └── vehicle/            # Chrono data root for the demo (see "Data paths")
         ├── LRV/            # Polaris vehicle JSONs + meshes
         ├── terrain/        # lunar_env_12.obj terrain mesh
@@ -86,18 +88,27 @@ arm then holds the rock up; close the window to exit.
   which keeps dof 3 **negative** (forearm angles up) via a soft penalty on
   positive dof 3 — steering to the elbow-up branch without losing convergence on
   far, near-singular targets.
-- **The rock is a build-time scene element** (`build_scene(rock_pos=...)`), added
-  before the first step so its collision binds normally. (Heads-up: a body added
+- **The rock** is the Curiosity `rock2.obj` mesh from chrono's data
+  (`data/rocks/`), built the way chrono's Curiosity demos do it: the scaled
+  `ChTriangleMeshConnected` serves as both the visual and the (sphere-swept)
+  collision shape of a `ChBodyAuxRef`, with mass/inertia computed from the
+  mesh (`ComputeMassProperties` + `ChInertiaUtils.PrincipalInertia`). At
+  scale 0.18 it stands ~0.26 m tall and is 0.17–0.20 m wide at the 0.22 m
+  grip plane — between the pads' minimum gap (~0.12 m) and their open gap
+  (0.41 m) at any yaw, which is why the grab height is fixed. It is a
+  **build-time scene element** (`build_scene(rock_pos=...)`), added before the
+  first step so its collision binds normally. (Heads-up: a body added
   *mid-run* instead would tunnel through the terrain unless registered with
   `system.GetCollisionSystem().BindItem(body)` — but calling that on a build-time
   body double-registers its contacts, so it's only for mid-run additions.)
-- **The grab** is deterministic rather than contact-driven: the scenario
-  registers the rock with `gripper.add_object("rock")`, closes the finger
-  motors to a snug grip (the pads sit ~0.205 m either side of the gripper
-  center when open; closing 0.145 m per finger lands them on the faces of the
-  0.12 m rock — the finger motors hit a travel stop just past 0.145), then
-  calls `gripper.add_lock()`, which welds the rock to the end-effector once
-  both fingers are within range. The fingers keep their imported pad collision
+- **The grab** closes the finger motors until the pads physically stall on the
+  rock: each control tick compares the fingers' actual separation against the
+  commanded one, and when the lag exceeds ~12 mm the pads have met the rock
+  (where that happens depends on the rock's yaw), the command is parked at the
+  stall point plus a light 2 mm bite, and the scenario calls
+  `gripper.add_lock()`, which welds the rock to the end-effector once both
+  fingers are within range (the rock is registered beforehand with
+  `gripper.add_object("rock")`). The fingers keep their imported pad collision
   shapes enabled (a thin contact box on each gripping face; `LRV_Arm` used to
   disable them), so the pads make real contact as they land on the rock — the
   rock can settle or tilt a few degrees under the bite before the lock freezes

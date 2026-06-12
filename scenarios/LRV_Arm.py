@@ -5,10 +5,11 @@ the chassis, standing (braked) on flat terrain.
 
 The demo runs two simulations:
 
-  * SIM 1 (headless): pick a random target behind the arm, drive the
-    end-effector there with inverse kinematics, let it settle, and *record* the
-    four joint angles and the gripper-center position (the midpoint of the two
-    fingers' centers of mass).
+  * SIM 1 (headless): pick a random target behind the arm (at the fixed grab
+    height GRAB_HEIGHT above the ground), drive the end-effector there with
+    inverse kinematics, let it settle, and *record* the four joint angles and
+    the gripper-center position (the midpoint of the two fingers' centers of
+    mass).
 
   * SIM 2 (visualized): rebuild the same scene, replay the recorded joint
     angles, and drop a rock at the recorded gripper-center position -- i.e.
@@ -49,37 +50,79 @@ INIT_LOC = chrono.ChVector3d(-83, -85, 0.5)
 INIT_ROT = chrono.ChQuaterniond(1, 0, 0, 0)
 STEP_SIZE = 1e-3
 
-# Grab-and-lift sequence (sim 2). The finger pads sit ~0.205 m either side of
-# the gripper center when open (motor position 0), so closing 0.145 m per
-# finger lands them on the faces of the 0.12 m rock (the motors hit a travel
-# stop just past 0.145). Over the whole sampling domain the settled theta 2
-# stays within [-16, 19] deg, so a 60 deg shoulder target always lifts.
+# The rock: the Curiosity rock2 mesh (from chrono's data, copied into
+# data/rocks). At ROCK_SCALE it stands ~0.26 m tall with a 0.17-0.20 m wide
+# cross-section at the grab height -- between the pads' minimum gap (~0.12 m)
+# and their open gap (0.41 m) at any rock yaw. The grab height is fixed (the
+# arm always reaches for GRAB_HEIGHT above the ground) so a single mesh scale
+# always fits the gripper.
+ROCK_MESH = os.path.join("data", "rocks", "rock2.obj")
+ROCK_SCALE = 0.16
+ROCK_ROT_X = math.radians(90.0)    # initial rock rotation about its local x axis
+ROCK_DENSITY = 1500                # kg/m^3
+GRAB_HEIGHT = 0.22                 # gripper-center target height above ground
+
+# Grab-and-lift sequence (sim 2). The fingers close until the pads stall on
+# the rock (where they meet it depends on the rock yaw), or at worst to
+# FINGER_CLOSE_POS, just before the finger motors' travel stop. Over the
+# whole sampling domain the settled theta 2 stays within [-16, 19] deg, so a
+# 60 deg shoulder target always lifts.
 CTRL_DT = 0.01                     # control tick for the staged grab/lift
 T_CLOSE = 4.5                      # close once the replayed pose has settled
 T_LIFT = 6.5                       # lift after the lock is in place
-FINGER_CLOSE_POS = 0.145           # finger travel from open to snug on the rock
+FINGER_OPEN_SEP = 0.388            # finger COM separation at open (motor pos 0)
+FINGER_CLOSE_POS = 0.145           # max finger travel from open
 FINGER_CLOSE_SPEED = 0.1           # m/s per finger
+GRIP_STALL_TOL = 0.012             # command-vs-actual lag that means "pads on rock"
 LIFT_THETA2 = math.radians(60.0)   # shoulder (theta 2) target for the lift
 LIFT_SPEED = 0.5                   # rad/s shoulder ramp
 
 
-def place_rock(system, pos, ground_z, footprint=0.12):
-    """Spawn a rock resting on the ground beneath the gripper center `pos`.
+def place_rock(system, pos, ground_z):
+    """Spawn the rock mesh resting on the ground beneath the gripper center `pos`.
 
-    `pos` is the recorded gripper center (typically 0.2-0.3 m above ground). The
-    box height (z) is sized to span from the ground up to that height, so the
-    rock stands in place from the start instead of free-falling from the gripper
-    and bouncing off. The footprint (x, y) stays small.
+    Follows the rock recipe from chrono's Curiosity demos: a scaled
+    ChTriangleMeshConnected used both as visual and (sphere-swept) collision
+    shape on a ChBodyAuxRef, with mass/inertia computed from the mesh. The
+    body is placed so the mesh bounding box is centered (x, y) under `pos`
+    with its bottom on the ground; the gripper, at GRAB_HEIGHT, then bites
+    the rock a few cm below its top.
     """
-    height = max(pos.z - ground_z, footprint)  # reach from ground to gripper center
+    mesh = chrono.ChTriangleMeshConnected.CreateFromWavefrontFile(
+        os.path.join(project_root, ROCK_MESH), False, True)
+    mesh.Transform(chrono.ChVector3d(0, 0, 0), chrono.ChMatrix33d(ROCK_SCALE))
+    mesh.Transform(chrono.ChVector3d(0, 0, 0),
+                   chrono.ChMatrix33d(chrono.QuatFromAngleX(ROCK_ROT_X)))
+
+    props = mesh.ComputeMassProperties(True)  # unit-density mass = volume
+    principal_I = chrono.ChVector3d()
+    principal_rot = chrono.ChMatrix33d()
+    chrono.ChInertiaUtils.PrincipalInertia(props.inertia, principal_I, principal_rot)
+
+    rock = chrono.ChBodyAuxRef()
+    rock.SetName("rock")
+    rock.SetFixed(False)
+    bb = mesh.GetBoundingBox()
+    # Rest the bottom on the ground, lifted by the sphere-swept collision
+    # radius so the inflated collision shape starts free of penetration.
+    rock.SetFrameRefToAbs(chrono.ChFramed(
+        chrono.ChVector3d(pos.x - (bb.min.x + bb.max.x) / 2.0,
+                          pos.y - (bb.min.y + bb.max.y) / 2.0,
+                          ground_z - bb.min.z + 0.005), chrono.QUNIT))
+    rock.SetFrameCOMToRef(chrono.ChFramed(props.com, principal_rot))
+    rock.SetMass(props.mass * ROCK_DENSITY)
+    rock.SetInertiaXX(principal_I * ROCK_DENSITY)
+
     mat = chrono.ChContactMaterialNSC()
     mat.SetFriction(0.7)
-    rock = chrono.ChBodyEasyBox(footprint, footprint, height, 1500, True, True, mat)
-    rock.SetName("rock")
-    # Center it so the box bottom sits on the ground and its top is at `pos.z`.
-    rock.SetPos(chrono.ChVector3d(pos.x, pos.y, ground_z + height / 2.0))
+    rock.AddCollisionShape(chrono.ChCollisionShapeTriangleMesh(mat, mesh, False, False, 0.005))
     rock.EnableCollision(True)
-    rock.GetVisualShape(0).SetColor(chrono.ChColor(0.45, 0.35, 0.28))  # rock-brown
+
+    vis = chrono.ChVisualShapeTriangleMesh()
+    vis.SetMesh(mesh)
+    vis.SetColor(chrono.ChColor(0.45, 0.35, 0.28))  # rock-brown
+    rock.AddVisualShape(vis)
+
     system.Add(rock)
     return rock
 
@@ -154,9 +197,10 @@ def sample_reachable_target(gripper, vehicle, terrain, ik_solver):
     """Random target behind the arm, solved with inverse kinematics.
 
     Polar around the arm base: theta in [90, 270] deg (the half-plane away from
-    the vehicle, which sits toward +x), r in [2, 3] m, and 0.2-0.3 m above the
-    ground. Re-samples if the point is out of reach (the arm spans ~2.7 m, so r
-    near 3 m can be unreachable). Returns the four joint angles.
+    the vehicle, which sits toward +x), r in [2, 3] m, and GRAB_HEIGHT above
+    the ground (fixed, so the rock mesh always fits the gripper). Re-samples if
+    the point is out of reach (the arm spans ~2.7 m, so r near 3 m can be
+    unreachable). Returns the four joint angles.
     """
     base = gripper.base.GetPos()
     vir_base = chrono.ChBody()
@@ -169,7 +213,7 @@ def sample_reachable_target(gripper, vehicle, terrain, ik_solver):
         tx = base.x + r * math.cos(theta)
         ty = base.y + r * math.sin(theta)
         ground_z = terrain.GetHeight(chrono.ChVector3d(tx, ty, base.z + 5.0))
-        target = chrono.ChVector3d(tx, ty, ground_z + random.uniform(0.2, 0.3))
+        target = chrono.ChVector3d(tx, ty, ground_z + GRAB_HEIGHT)
         des_loc = vir_base.TransformPointParentToLocal(target)
         try:
             with contextlib.redirect_stdout(io.StringIO()):  # hush retry chatter
@@ -216,7 +260,7 @@ def drive_arm(system, vehicle, terrain, gripper, theta, vis=None, settle_time=4.
     driver_inputs.m_braking = 1.0  # hold the vehicle still
 
     render_steps = math.ceil((1.0 / 30) / STEP_SIZE)
-    moved_arm = bent_arm = False
+    moved_arm = bent_arm = gripped = False
     close_pos = 0.0    # current finger-motor target (0 = open)
     lift_angle = None  # current shoulder target while lifting
     next_tick = 0.0    # next control-tick time for the staged grab/lift
@@ -254,17 +298,30 @@ def drive_arm(system, vehicle, terrain, gripper, theta, vis=None, settle_time=4.
         # vehicle.Advance (the vehicle owns the system).
         if grab and time > T_CLOSE and time >= next_tick:
             next_tick = time + CTRL_DT
-            if close_pos < FINGER_CLOSE_POS:
-                # Close the fingers gradually around the rock.
+            if not gripped:
+                # Close the fingers gradually until the pads stall on the rock
+                # (or, with nothing in the way, until the travel cap).
                 close_pos = min(close_pos + FINGER_CLOSE_SPEED * CTRL_DT,
                                 FINGER_CLOSE_POS)
                 gripper.move_linear_motor(gripper.motor_endoffactor_finger_1, -close_pos)
                 gripper.move_linear_motor(gripper.motor_endoffactor_finger_2, close_pos)
-                if close_pos >= FINGER_CLOSE_POS:
+                actual_sep = (gripper.finger_1.GetPos()
+                              - gripper.finger_2.GetPos()).Length()
+                stalled = actual_sep - (FINGER_OPEN_SEP - 2 * close_pos) > GRIP_STALL_TOL
+                if stalled or close_pos >= FINGER_CLOSE_POS:
+                    if stalled:
+                        # Park the command where the fingers actually are (plus
+                        # a light 2 mm bite) so the position motors hold the
+                        # rock instead of crushing into it.
+                        close_pos = (FINGER_OPEN_SEP - actual_sep) / 2.0 + 0.002
+                        gripper.move_linear_motor(gripper.motor_endoffactor_finger_1, -close_pos)
+                        gripper.move_linear_motor(gripper.motor_endoffactor_finger_2, close_pos)
+                    gripped = True
                     gripper.add_lock()  # lock the grabbed object to the end-effector
                     if gripper.cur_lock:
-                        print(f"  gripper closed, '{gripper.cur_object}' locked to "
-                              f"the end-effector (t={time:.2f} s)")
+                        print(f"  gripper closed (sep {actual_sep:.3f} m), "
+                              f"'{gripper.cur_object}' locked to the end-effector "
+                              f"(t={time:.2f} s)")
                     else:
                         print(f"  gripper closed but no object in range to lock "
                               f"(t={time:.2f} s)")
