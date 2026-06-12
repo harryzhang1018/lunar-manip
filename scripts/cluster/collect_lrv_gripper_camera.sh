@@ -2,8 +2,8 @@
 #SBATCH --job-name=lrv-camera
 #SBATCH --output=logs/lrv_camera_%j.out
 #SBATCH --error=logs/lrv_camera_%j.err
-#SBATCH --partition=research
-#SBATCH --gres=gpu:rtx4000ada:1
+#SBATCH --partition=sbel
+#SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=04:00:00
@@ -21,10 +21,11 @@
 # Override collection settings at submit time:
 #   sbatch --export=ALL,EPISODES=1000,SEED=100,OUT_DIR=artifacts/datasets/lrv_camera_1k scripts/cluster/collect_lrv_gripper_camera.sh
 #
-# If rtx4000ada nodes are busy or OptiX has trouble with that GPU type, override
-# the GPU request from the sbatch command line:
+# If the sbel A100 node is busy or OptiX has trouble with that GPU type, override
+# the partition/GPU request from the sbatch command line:
+#   sbatch -p research --gres=gpu:rtx4000ada:1 scripts/cluster/collect_lrv_gripper_camera.sh
 #   sbatch --gres=gpu:rtxa4500:1 scripts/cluster/collect_lrv_gripper_camera.sh
-#   sbatch --gres=gpu:a100:1 scripts/cluster/collect_lrv_gripper_camera.sh
+#   sbatch -p research --gres=gpu:h100:1 scripts/cluster/collect_lrv_gripper_camera.sh
 
 set -euo pipefail
 
