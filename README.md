@@ -13,7 +13,11 @@ The demo is a **record/replay** of a rock placement, run as two simulations:
 - **Sim 2 (visualized):** rebuild the same scene **with a rock placed at the
   recorded gripper-center position** (`build_scene(rock_pos=...)`) and **replay**
   the recorded angles. Recording the *actual* settled pose (vs. the IK target)
-  absorbs IK residual error and dynamic sag.
+  absorbs IK residual error and dynamic sag. Once the pose settles, the demo
+  finishes the last mile: it **closes the gripper fingers** around the rock,
+  **locks the rock to the end-effector** (`ChLinkLockLock` via
+  `gripper.add_lock()`), and **lifts it** by ramping the shoulder joint
+  (theta 2) up to 60°.
 
 `LRV_Arm` and the inverse-kinematics solver come from the `model` package.
 
@@ -57,8 +61,10 @@ python scenarios/LRV_Arm.py
 ```
 
 Sim 1 runs headless first (a couple of seconds) to record the pose, then an
-Irrlicht window opens for sim 2 showing the arm replaying that pose and a rock
-dropped at the recorded spot. Close the window to exit.
+Irrlicht window opens for sim 2 showing the arm replaying that pose onto a rock
+placed at the recorded spot, closing the gripper (t ≈ 4.5–6 s), locking the
+rock to the end-effector, and lifting it (t ≈ 6.5–9 s, shoulder to 60°). The
+arm then holds the rock up; close the window to exit.
 
 ## Notes
 
@@ -85,7 +91,24 @@ dropped at the recorded spot. Close the window to exit.
   *mid-run* instead would tunnel through the terrain unless registered with
   `system.GetCollisionSystem().BindItem(body)` — but calling that on a build-time
   body double-registers its contacts, so it's only for mid-run additions.)
-- **Next steps.** The rock is placed where the gripper sits but not yet grabbed.
-  To pick it up, `gripper.grab_object()` (closes the fingers and locks the rock
-  to the end-effector on contact); to release, `gripper.open()`. To drive the
-  rover, feed nonzero `driver_inputs` (e.g. attach `veh.ChInteractiveDriverIRR(vis)`).
+- **The grab** is deterministic rather than contact-driven: the scenario
+  registers the rock with `gripper.add_object("rock")`, closes the finger
+  motors to a snug grip (the pads sit ~0.205 m either side of the gripper
+  center when open; closing 0.145 m per finger lands them on the faces of the
+  0.12 m rock — the finger motors hit a travel stop just past 0.145), then
+  calls `gripper.add_lock()`, which welds the rock to the end-effector once
+  both fingers are within range. The fingers keep their imported pad collision
+  shapes enabled (a thin contact box on each gripping face; `LRV_Arm` used to
+  disable them), so the pads make real contact as they land on the rock — the
+  rock can settle or tilt a few degrees under the bite before the lock freezes
+  it. (Don't replace the pads with a single box bounding the whole finger
+  mesh: the finger is L-shaped, so its bounding box fills the gripping slot
+  with phantom volume that shoves the rock away ~10 cm before the visible
+  pads arrive. The model's `gripper.grab_object()` offers a
+  contact-count-driven alternative, but tire–terrain contacts make contact
+  counting unreliable in this scene.) The lift ramps the shoulder
+  (theta 2) at 0.5 rad/s to 60°; over the whole sampling domain the settled
+  theta 2 stays within [−16°, 19°], so the 60° target always lifts.
+- **Next steps.** To release the rock, `gripper.open()` (removes the lock and
+  re-opens the fingers). To drive the rover, feed nonzero `driver_inputs`
+  (e.g. attach `veh.ChInteractiveDriverIRR(vis)`).

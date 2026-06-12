@@ -15,7 +15,9 @@ The demo runs two simulations:
     right where the gripper actually ends up. Because the scene and inputs are
     identical, the gripper settles at the same spot, so the rock lands at the
     gripper. (Recording the *actual* settled pose, rather than the IK target,
-    accounts for IK residual error and dynamic sag.)
+    accounts for IK residual error and dynamic sag.) Then the last mile: the
+    fingers close around the rock, the rock is locked to the end-effector, and
+    the arm lifts it by ramping the shoulder joint (theta 2) up to 60 deg.
 
 `LRV_Arm` and `RobotArmInverseKinematicsSolver` come from the `model` package.
 
@@ -46,6 +48,19 @@ from model.inverseKin import RobotArmInverseKinematicsSolver
 INIT_LOC = chrono.ChVector3d(-83, -85, 0.5)
 INIT_ROT = chrono.ChQuaterniond(1, 0, 0, 0)
 STEP_SIZE = 1e-3
+
+# Grab-and-lift sequence (sim 2). The finger pads sit ~0.205 m either side of
+# the gripper center when open (motor position 0), so closing 0.145 m per
+# finger lands them on the faces of the 0.12 m rock (the motors hit a travel
+# stop just past 0.145). Over the whole sampling domain the settled theta 2
+# stays within [-16, 19] deg, so a 60 deg shoulder target always lifts.
+CTRL_DT = 0.01                     # control tick for the staged grab/lift
+T_CLOSE = 4.5                      # close once the replayed pose has settled
+T_LIFT = 6.5                       # lift after the lock is in place
+FINGER_CLOSE_POS = 0.145           # finger travel from open to snug on the rock
+FINGER_CLOSE_SPEED = 0.1           # m/s per finger
+LIFT_THETA2 = math.radians(60.0)   # shoulder (theta 2) target for the lift
+LIFT_SPEED = 0.5                   # rad/s shoulder ramp
 
 
 def place_rock(system, pos, ground_z, footprint=0.12):
@@ -183,8 +198,14 @@ def make_vis(vehicle, title):
     return vis
 
 
-def drive_arm(system, vehicle, terrain, gripper, theta, vis=None, settle_time=4.0):
+def drive_arm(system, vehicle, terrain, gripper, theta, vis=None, settle_time=4.0,
+              grab=False):
     """Brake the vehicle and drive the arm to `theta` (staggered to avoid a snap).
+
+    With `grab=True`, once the pose has settled the gripper finishes the last
+    mile: it closes the fingers (t > T_CLOSE), locks the registered object to
+    the end-effector via `gripper.add_lock()`, and lifts it by ramping the
+    shoulder joint (theta 2) to LIFT_THETA2 (t > T_LIFT).
 
     With `vis`, render until the window is closed; otherwise step headless until
     `settle_time` seconds. Returns the final gripper-center position.
@@ -196,6 +217,9 @@ def drive_arm(system, vehicle, terrain, gripper, theta, vis=None, settle_time=4.
 
     render_steps = math.ceil((1.0 / 30) / STEP_SIZE)
     moved_arm = bent_arm = False
+    close_pos = 0.0    # current finger-motor target (0 = open)
+    lift_angle = None  # current shoulder target while lifting
+    next_tick = 0.0    # next control-tick time for the staged grab/lift
     steps = 0
     if vis is not None:
         vehicle.EnableRealtime(True)
@@ -224,6 +248,39 @@ def drive_arm(system, vehicle, terrain, gripper, theta, vis=None, settle_time=4.
             gripper.rotate_motor(gripper.motor_elbow_eef, theta[3])
             bent_arm = True
 
+        # ---- last mile: close the gripper, lock the rock, lift it ----
+        # Ticks are keyed on sim time (not the loop counter) because each loop
+        # iteration advances the system twice: DoStepDynamics here plus
+        # vehicle.Advance (the vehicle owns the system).
+        if grab and time > T_CLOSE and time >= next_tick:
+            next_tick = time + CTRL_DT
+            if close_pos < FINGER_CLOSE_POS:
+                # Close the fingers gradually around the rock.
+                close_pos = min(close_pos + FINGER_CLOSE_SPEED * CTRL_DT,
+                                FINGER_CLOSE_POS)
+                gripper.move_linear_motor(gripper.motor_endoffactor_finger_1, -close_pos)
+                gripper.move_linear_motor(gripper.motor_endoffactor_finger_2, close_pos)
+                if close_pos >= FINGER_CLOSE_POS:
+                    gripper.add_lock()  # lock the grabbed object to the end-effector
+                    if gripper.cur_lock:
+                        print(f"  gripper closed, '{gripper.cur_object}' locked to "
+                              f"the end-effector (t={time:.2f} s)")
+                    else:
+                        print(f"  gripper closed but no object in range to lock "
+                              f"(t={time:.2f} s)")
+            elif time > T_LIFT and lift_angle != LIFT_THETA2:
+                # Ramp the shoulder (theta 2) up to the lift angle.
+                if lift_angle is None:
+                    lift_angle = theta[1]
+                    print(f"  lifting: theta 2 {math.degrees(theta[1]):.1f} -> "
+                          f"{math.degrees(LIFT_THETA2):.1f} deg")
+                d = LIFT_THETA2 - lift_angle
+                if abs(d) <= LIFT_SPEED * CTRL_DT:
+                    lift_angle = LIFT_THETA2
+                else:
+                    lift_angle += math.copysign(LIFT_SPEED * CTRL_DT, d)
+                gripper.rotate_motor(gripper.motor_shoulder_biceps, lift_angle)
+
         # Keep the vehicle/terrain/visual modules in sync (brakes held).
         vehicle.Synchronize(time, driver_inputs, terrain)
         terrain.Synchronize(time)
@@ -251,11 +308,12 @@ def main():
     print(f"  recorded joint angles  : {final_theta}")
     print(f"  recorded gripper center: {ee_pos}")
 
-    # ---- SIM 2 (visualized): build with the rock at the recorded spot, replay. ----
-    print("=== SIM 2: rock built into scene at recorded gripper center, replaying angles ===")
+    # ---- SIM 2 (visualized): rock at the recorded spot; replay, grab, lift. ----
+    print("=== SIM 2: rock at recorded gripper center -- replay, grab, and lift ===")
     system2, vehicle2, terrain2, gripper2 = build_scene(rock_pos=ee_pos)
-    vis = make_vis(vehicle2, "LRV Gripper -- replay + rock at recorded EE")
-    drive_arm(system2, vehicle2, terrain2, gripper2, final_theta, vis=vis)
+    gripper2.add_object("rock")  # register the rock with the gripper's lock logic
+    vis = make_vis(vehicle2, "LRV Gripper -- replay, grab, and lift")
+    drive_arm(system2, vehicle2, terrain2, gripper2, final_theta, vis=vis, grab=True)
 
 
 if __name__ == "__main__":

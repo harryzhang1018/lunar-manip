@@ -98,8 +98,10 @@ class LRV_Arm:
         self.endoffactor.SetPos(pos+self.endoffactor.GetPos())
         self.finger_1.SetPos(pos+self.finger_1.GetPos())
         self.finger_2.SetPos(pos+self.finger_2.GetPos())
-        self.finger_1.EnableCollision(False)
-        self.finger_2.EnableCollision(False)
+        # Keep the imported finger collision shapes (a thin contact pad box on
+        # each gripping face) active so the fingers can touch grasped objects.
+        self.finger_1.EnableCollision(True)
+        self.finger_2.EnableCollision(True)
         
         if attached_vehicle:
             # add linklock to the base of the arm and the object
@@ -111,8 +113,6 @@ class LRV_Arm:
         else:
             self.base.SetFixed(True)
             print("!!!!!!!!!!!!!base fixed!!!!!!!!!!!!")
-        # self.finger_1.EnableCollision(True)
-        # self.finger_2.EnableCollision(True)
 
         self.objects = list()
         self.gripper_on = False
