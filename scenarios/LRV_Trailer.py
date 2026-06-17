@@ -29,7 +29,8 @@ Run with the project's conda env:
     conda run -n chrono python scenarios/LRV_Trailer.py
 
 Add `--headless` to step the simulation without opening a render window (used for
-smoke tests).
+smoke tests). Add `--vsg` to render with the VSG (Vulkan) backend instead of the
+default Irrlicht (OpenGL) one.
 """
 
 import os
@@ -66,12 +67,12 @@ TRAILER_BED_OFFSET = chrono.ChVector3d(0, 0, 0.05)  # bed sits just above the ch
 # (like LRV_Arm.py's reachable sampling). Theta covers the rear-left and rear-right
 # wedges -- [90, 90+60] and [270-60, 270] deg -- skipping straight behind, where
 # the trailer sits; r is the distance from the base.
-ROCK_THETA_RANGES_DEG = ((90.0, 150.0), (210.0, 270.0))
-ROCK_R_RANGE = (2.0, 3.0)
+ROCK_THETA_RANGES_DEG = ((70.0, 120.0), (240.0, 290.0))
+ROCK_R_RANGE = (2.0, 2.75)
 
 # Grasp-and-place sequence: hold the brakes, let the scene settle, then pick the
 # rocks up one at a time and drop each on the trailer.
-NUM_ROCKS = 2         # how many rocks to spawn and load
+NUM_ROCKS = 3         # how many rocks to spawn and load
 ROCK_MIN_SEP = 0.8    # keep spawned rocks at least this far apart (m)
 T_GRASP_START = 1.0   # begin the first grasp once the rover and rocks have settled
 # Drop point for each rock: the gripper is moved to the trailer chassis center plus
@@ -80,10 +81,22 @@ T_GRASP_START = 1.0   # begin the first grasp once the rover and rocks have sett
 PLACE_OFFSET = chrono.ChVector3d(0.0, 0, 0.5)
 PLACE_SPREAD_Y = 0.4
 
+# After every rock is loaded, the rover drives off, stops, and dumps the load:
+# drive forward for DRIVE_TIME s (throttle DRIVE_THROTTLE, steering DRIVE_STEERING),
+# brake to a stop for STOP_TIME s, then run one dump() cycle to unload the bed.
+# The throttle is eased in over DRIVE_RAMP s (rather than slammed to full at t=0) and
+# kept gentle so the rocks ride along in the shallow tub instead of tumbling out, so
+# the bed still has its load when dump() tips it off.
+DRIVE_TIME = 6.0
+DRIVE_THROTTLE = 0.2
+DRIVE_STEERING = 0.1
+DRIVE_RAMP = 3.0
+STOP_TIME = 1.0
+
 # Headless smoke-test duration (seconds of sim time): long enough to cover NUM_ROCKS
-# pick-and-place cycles (~15 s each, worst case) and settle. With a render window
-# the scene instead holds until the window is closed.
-HEADLESS_RUN_TIME = 40.0
+# pick-and-place cycles (~15 s each, worst case), the drive-off + stop + dump cycle,
+# and settle. With a render window the scene instead holds until the window is closed.
+HEADLESS_RUN_TIME = 80.0
 
 
 class TrailerDumpBed:
@@ -219,7 +232,7 @@ class TrailerArm(LRV_Arm):
     LIFT_DELAY = 1.5        # lift this long after the rock is gripped
     PLACE_TOL = 0.15        # release once the gripper is this close to the drop point
     T_PLACE_MOVE = 6.0      # ...or after this long, whichever comes first (timeout)
-    STOW_THETA = (-math.pi, math.pi / 5, -math.pi / 4 , 0.0)  # home pose [t1,t2,t3,t4] after a place
+    STOW_THETA = (-math.pi, math.pi / 5, math.pi / 4 , 0.0)  # home pose [t1,t2,t3,t4] after a place
     STOW_DELAY = 1.0        # hold over the bed this long after releasing (rock settles) before stowing
     T_STOW = 2.0            # hold the stow pose this long, then the grasp is done
 
@@ -551,16 +564,34 @@ def build_scene():
     return system, vehicle, trailer, terrain, gripper, dump_bed, rocks
 
 
-def make_vis(vehicle, title):
-    """Create and initialize an Irrlicht visualization attached to `vehicle`."""
+def make_vis(vehicle, title, use_vsg=False):
+    """Create and initialize a visualization attached to `vehicle`.
+
+    Defaults to Irrlicht (OpenGL); pass `use_vsg=True` for the VSG (Vulkan) backend.
+    Both expose the same run/render/step interface, so only the setup differs: VSG
+    has its own lighting/sky API and wants `AttachVehicle()` before `Initialize()`.
+    """
+    if use_vsg:
+        vis = veh.ChWheeledVehicleVisualSystemVSG()
+        vis.SetWindowTitle(title)
+        vis.SetWindowSize(1280, 1024)
+        # vis.EnableSkyTexture()
+        vis.SetLightIntensity(1.0)
+        vis.SetLightDirection(2.0, 0.75)
+        vis.EnableShadows()
+        vis.SetChaseCamera(chrono.ChVector3d(0.0, 0.0, 2.75), 15.0, 1.5)
+        vis.AttachVehicle(vehicle)
+        vis.Initialize()
+        return vis
+
     vis = veh.ChWheeledVehicleVisualSystemIrrlicht()
     vis.SetWindowTitle(title)
     vis.SetWindowSize(1280, 1024)
-    vis.SetChaseCamera(chrono.ChVector3d(0.0, 0.0, 1.75), 8.0, 0.5)
+    vis.SetChaseCamera(chrono.ChVector3d(0.0, 2.0, 2.75), 10.0, 1.5)
     vis.Initialize()
     # Light above the (stationary) vehicle, aimed at it, so the work area is lit.
     vis.AddLightWithShadow(INIT_LOC + chrono.ChVector3d(0, 0, 30), INIT_LOC,
-                           20, 1, 60, 100)
+                           20, 1, 60, 50)
     vis.AddTypicalLights()
     vis.AttachVehicle(vehicle)
     return vis
@@ -574,16 +605,18 @@ def place_point(trailer, idx, n):
             + PLACE_OFFSET + chrono.ChVector3d(0, lateral, 0))
 
 
-def brake_and_grasp(system, vehicle, trailer, terrain, gripper, rocks, vis=None,
-                    run_time=HEADLESS_RUN_TIME):
+def brake_and_grasp(system, vehicle, trailer, terrain, gripper, dump_bed, rocks,
+                    vis=None, run_time=HEADLESS_RUN_TIME):
     """Hold the rover's brakes; after the scene settles, pick each rock up in turn
-    and drop it on the trailer.
+    and drop it on the trailer; then drive off, stop, and dump the load.
 
     Once `T_GRASP_START` has elapsed, `gripper.grasp(rock, place_pos)` is called
     every step for the current rock; when it returns True (rock released on the
     bed) the loop advances to the next rock -- the gripper's state machine restarts
-    automatically for the new target. With `vis`, render until the window is closed;
-    otherwise step headless until `run_time` seconds (for smoke tests).
+    automatically for the new target. After every rock is loaded the rover releases
+    the brakes and drives forward for DRIVE_TIME s, brakes to a stop for STOP_TIME s,
+    then runs one `dump_bed.dump()` cycle to unload. With `vis`, render until the
+    window is closed; otherwise step headless until `run_time` seconds (smoke test).
     """
     driver_inputs = veh.DriverInputs()
     driver_inputs.m_throttle = 0.0
@@ -592,7 +625,9 @@ def brake_and_grasp(system, vehicle, trailer, terrain, gripper, rocks, vis=None,
 
     render_steps = math.ceil((1.0 / 30) / STEP_SIZE)
     steps = 0
-    idx = 0  # index of the rock currently being picked and placed
+    idx = 0           # index of the rock currently being picked and placed
+    t_loaded = None   # sim time at which the last rock was loaded (drive-off start)
+    dumped = False    # whether the dump cycle has been triggered yet
     if vis is not None:
         vehicle.EnableRealtime(True)
 
@@ -609,11 +644,34 @@ def brake_and_grasp(system, vehicle, trailer, terrain, gripper, rocks, vis=None,
             vis.Render()
             vis.EndScene()
 
-        # ---- once settled, pick and place each rock in turn ----
-        if time > T_GRASP_START and idx < len(rocks):
-            if gripper.grasp(rocks[idx], place_point(trailer, idx, len(rocks))):
-                print(f"  -> rock {idx} placed on the trailer")
-                idx += 1  # advance to the next rock (grasp() restarts on the new one)
+        if idx < len(rocks):
+            # ---- still loading: hold the brakes and pick/place each rock in turn ----
+            driver_inputs.m_throttle = 0.0
+            driver_inputs.m_steering = 0.0
+            driver_inputs.m_braking = 1.0
+            if time > T_GRASP_START:
+                if gripper.grasp(rocks[idx], place_point(trailer, idx, len(rocks))):
+                    print(f"  -> rock {idx} placed on the trailer")
+                    idx += 1  # advance to the next rock (grasp() restarts on the new one)
+        else:
+            # ---- all rocks loaded: drive off, brake to a stop, then dump ----
+            if t_loaded is None:
+                t_loaded = time
+                print(f"  all {len(rocks)} rocks loaded -- driving off")
+            since = time - t_loaded
+            if since < DRIVE_TIME:
+                # ease the throttle in over DRIVE_RAMP s so the rocks don't lurch off
+                driver_inputs.m_throttle = DRIVE_THROTTLE * min(1.0, since / DRIVE_RAMP)
+                driver_inputs.m_steering = DRIVE_STEERING
+                driver_inputs.m_braking = 0.0
+            else:
+                driver_inputs.m_throttle = 0.0
+                driver_inputs.m_steering = 0.0
+                driver_inputs.m_braking = 1.0  # brake to a stop, then hold
+                if since >= DRIVE_TIME + STOP_TIME and not dumped:
+                    print("  stopped -- dumping the load")
+                    dump_bed.dump()
+                    dumped = True
 
         # Keep the vehicle, trailer, terrain, and visual modules in sync.
         vehicle.Synchronize(time, driver_inputs, terrain)
@@ -631,6 +689,7 @@ def brake_and_grasp(system, vehicle, trailer, terrain, gripper, rocks, vis=None,
 
 def main():
     headless = "--headless" in sys.argv
+    use_vsg = "--vsg" in sys.argv  # render with VSG (Vulkan) instead of Irrlicht
     title = f"LRV + trailer: pick up {NUM_ROCKS} rocks and load them onto the trailer"
     print(f"=== {title} (headless smoke test) ===" if headless else f"=== {title} ===")
     system, vehicle, trailer, terrain, gripper, dump_bed, rocks = build_scene()
@@ -642,8 +701,9 @@ def main():
               f"(r={math.hypot(rel.x, rel.y):.2f} m, "
               f"theta={math.degrees(math.atan2(rel.y, rel.x)) % 360:.0f} deg)")
 
-    vis = None if headless else make_vis(vehicle, "LRV With Trailer -- Pick and Place")
-    brake_and_grasp(system, vehicle, trailer, terrain, gripper, rocks, vis=vis)
+    vis = None if headless else make_vis(vehicle, "LRV With Trailer -- Pick and Place",
+                                         use_vsg=use_vsg)
+    brake_and_grasp(system, vehicle, trailer, terrain, gripper, dump_bed, rocks, vis=vis)
 
     if headless:
         bed_pos = trailer.GetChassis().GetBody().GetPos()
