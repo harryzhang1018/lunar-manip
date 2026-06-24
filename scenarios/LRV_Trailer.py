@@ -59,6 +59,11 @@ INIT_LOC = chrono.ChVector3d(-83, -85, 0.5)
 INIT_ROT = chrono.ChQuaterniond(1, 0, 0, 0)
 STEP_SIZE = 1e-3
 
+# Uniform geometric scale of the gripper arm (1.0 = as exported). Forwarded to
+# both LRV_Arm and its IK solver; the grasp tuning and rock-spawn radius below
+# scale with it. Mass/inertia stay at 1x values (geometry-only scaling).
+ARM_SCALE = 1.0
+
 # Trailer (WheeledTrailer) and the dumping bed mounted on top of it.
 TRAILER_FILE = "LRV_Wagon/Polaris.json"
 TRAILER_BED_MESH = "LRV_Wagon/trailer_chassis_open.obj"
@@ -68,12 +73,12 @@ TRAILER_BED_OFFSET = chrono.ChVector3d(0, 0, 0.05)  # bed sits just above the ch
 # wedges -- [90, 90+60] and [270-60, 270] deg -- skipping straight behind, where
 # the trailer sits; r is the distance from the base.
 ROCK_THETA_RANGES_DEG = ((70.0, 120.0), (240.0, 290.0))
-ROCK_R_RANGE = (2.0, 2.75)
+ROCK_R_RANGE = (2.0 * ARM_SCALE, 2.75 * ARM_SCALE)
 
 # Grasp-and-place sequence: hold the brakes, let the scene settle, then pick the
 # rocks up one at a time and drop each on the trailer.
 NUM_ROCKS = 3         # how many rocks to spawn and load
-ROCK_MIN_SEP = 0.8    # keep spawned rocks at least this far apart (m)
+ROCK_MIN_SEP = 0.8 * ARM_SCALE    # keep spawned rocks at least this far apart (m)
 T_GRASP_START = 1.0   # begin the first grasp once the rover and rocks have settled
 # Drop point for each rock: the gripper is moved to the trailer chassis center plus
 # this offset, then released, so the rock falls onto the bed. Successive rocks are
@@ -245,10 +250,16 @@ class TrailerArm(LRV_Arm):
     LIFT_THETA2 = math.radians(60.0)   # shoulder (theta 2) target for the lift
     LIFT_SPEED = 0.5                   # rad/s shoulder ramp
 
-    def __init__(self, system, pos, attached_vehicle=None, ik_solver=None):
-        super().__init__(system, pos, attached_vehicle)
+    def __init__(self, system, pos, attached_vehicle=None, ik_solver=None, scale=1.0):
+        super().__init__(system, pos, attached_vehicle, scale=scale)
         self.attached_vehicle = attached_vehicle
-        self.ik_solver = ik_solver or RobotArmInverseKinematicsSolver()
+        self.ik_solver = ik_solver or RobotArmInverseKinematicsSolver(scale=scale)
+        # Geometric tuning scales with the arm; angles, times, and rad/s speeds do
+        # not. These shadow the class constants of the same name.
+        for attr in ("GRAB_HEIGHT", "GRASP_REACH_TOL", "PLACE_TOL",
+                     "FINGER_OPEN_SEP", "FINGER_CLOSE_POS",
+                     "FINGER_CLOSE_SPEED", "GRIP_STALL_TOL"):
+            setattr(self, attr, getattr(self, attr) * scale)
         self._grasp_target = None
         self._grasp_done = True
         self._place_pos = None
@@ -503,7 +514,7 @@ def build_scene():
 
     # ---- Gripper arm welded to the back of the chassis ----
     arm_offset = vehicle.GetChassis().GetPos() + chrono.ChVector3d(-1.1, 0, 0.1)
-    gripper = TrailerArm(system, arm_offset, vehicle)
+    gripper = TrailerArm(system, arm_offset, vehicle, scale=ARM_SCALE)
 
     # ---- Towed trailer hitched behind the rover ----
     trailer = veh.WheeledTrailer(system, veh.GetVehicleDataFile(TRAILER_FILE))

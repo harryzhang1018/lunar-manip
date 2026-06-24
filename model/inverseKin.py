@@ -3,12 +3,14 @@ from scipy.optimize import minimize
 import pychrono as chrono
 
 class RobotArmInverseKinematicsSolver:
-    def __init__(self):
+    def __init__(self, scale=1.0):
         """
         Initialize the robot arm inverse kinematics solver.
 
+        ``scale`` must match the geometric scale passed to ``LRV_Arm`` so the
+        link lengths used here line up with the simulated arm.
         """
-        self.a1, self.a2, self.a3 , self.a4 = 0.32516, 1.27, 1.143, 0.3052
+        self.a1, self.a2, self.a3 , self.a4 = (v * scale for v in (0.32516, 1.27, 1.143, 0.3052))
     # Define the forward kinematics equations for the robot arm
     def forward_kinematics(self, theta):
         theta1, theta2, theta3, theta4 = theta

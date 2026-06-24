@@ -6,8 +6,12 @@ import time
 
 
 class LRV_Arm:
-    def __init__(self, system, pos,attached_vehicle=None):
+    def __init__(self, system, pos, attached_vehicle=None, scale=1.0):
         self.system = system
+        # Uniform geometric scale factor for the whole arm (1.0 = as exported).
+        # Applied to link lengths, joint locations, meshes, contact pads, and the
+        # finger travel/grasp constants below. Mass and inertia are unchanged.
+        self.scale = scale
         self._set_data_dir()
         self._initialize(pos,attached_vehicle)
         
@@ -15,8 +19,8 @@ class LRV_Arm:
         # self.rotate_motor(self.motor_shoulder_biceps, 0)
         # self.rotate_motor(self.motor_biceps_elbow, 0)
         # self.rotate_motor(self.motor_elbow_eef, 0)
-        self.move_linear_motor(self.motor_endoffactor_finger_1, -0.15)
-        self.move_linear_motor(self.motor_endoffactor_finger_2, 0.15)
+        self.move_linear_motor(self.motor_endoffactor_finger_1, -0.15*self.scale)
+        self.move_linear_motor(self.motor_endoffactor_finger_2, 0.15*self.scale)
         
         # self._setup_locks()
 
@@ -50,6 +54,10 @@ class LRV_Arm:
         self.joint_biceps_elbow = self.system.SearchMarker("joint_elbow_bicep")
         self.joint_elbow_eff = self.system.SearchMarker("joint_wrist_elbow")
         self.joint_endoffactor = self.system.SearchMarker("joint_eff")
+
+        # Scale the geometry before any joints/motors are built so their frames
+        # are created at the scaled joint locations.
+        self._apply_scale()
 
         # Adding lock link between endoffactor and wrist
         self.lock = chrono.ChLinkLockLock()
@@ -119,13 +127,76 @@ class LRV_Arm:
         self.cur_lock = None
         self.cur_object = None
         self.object_contact_count = None
-        self.motor_val = 0.058
+        self.motor_val = 0.058 * self.scale
 
         self.gripper_left_or_right = True
         self.flag = False
         self.lock_flag = False
 
         
+    def _apply_scale(self):
+        """Uniformly scale the arm geometry by self.scale about the model origin.
+
+        Scales link placements (REF frames), COM offsets, visual meshes, joint
+        marker positions, and the finger contact pads. Mass and inertia are left
+        unchanged (geometric scaling only); rotations are scale-invariant. Must
+        run after the bodies/markers are imported but before the motors/locks are
+        created, so the joint frames are built at the scaled positions.
+        """
+        s = self.scale
+        if s == 1.0:
+            return
+
+        bodies = [self.base, self.shoulder, self.biceps, self.elbow,
+                  self.wrist, self.endoffactor, self.finger_1, self.finger_2]
+        for body in bodies:
+            aux = chrono.CastToChBodyAuxRef(body)
+            ref = aux.GetFrameRefToAbs()
+            aux.SetFrameRefToAbs(chrono.ChFramed(ref.GetPos() * s, ref.GetRot()))
+            com = aux.GetFrameCOMToRef()
+            aux.SetFrameCOMToRef(chrono.ChFramed(com.GetPos() * s, com.GetRot()))
+            # Bake the scale into the mesh geometry. ChVisualShapeModelFile.SetScale
+            # is ignored by the Irrlicht/VSG renderers (it updates GetScale but not
+            # the drawn size), which leaves the original-size meshes gapped between
+            # the scaled-apart joints. So reload each OBJ into a ChTriangleMeshConnected,
+            # scale its vertices, and swap in a ChVisualShapeTriangleMesh.
+            vis = body.GetVisualModel()
+            if vis and vis.GetNumShapes() > 0:
+                specs = []
+                for i in range(vis.GetNumShapes()):
+                    mf = chrono.CastToChVisualShapeModelFile(vis.GetShape(i))
+                    if mf is not None:
+                        fname = mf.GetFilename()
+                        if not os.path.isabs(fname):
+                            fname = os.path.join(self.data_dir, fname)
+                        specs.append((fname, vis.GetShapeFrame(i), mf.GetColor()))
+                if specs:
+                    vis.Clear()
+                    for fname, frame, color in specs:
+                        tri = chrono.ChTriangleMeshConnected()
+                        tri.LoadWavefrontMesh(fname, True, True)
+                        tri.Transform(chrono.ChVector3d(0, 0, 0), chrono.ChMatrix33d(s))
+                        tshape = chrono.ChVisualShapeTriangleMesh()
+                        tshape.SetMesh(tri)
+                        tshape.SetColor(color)
+                        tshape.SetMutable(False)
+                        body.AddVisualShape(tshape, frame)
+
+        for marker in [self.joint_base_shoulder, self.joint_shoulder_biceps,
+                       self.joint_biceps_elbow, self.joint_elbow_eff,
+                       self.joint_endoffactor]:
+            marker.ImposeAbsoluteTransform(
+                chrono.ChFramed(marker.GetPos() * s, marker.GetRot()))
+
+        # The imported finger contact pads have fixed dimensions; rebuild scaled.
+        for finger in [self.finger_1, self.finger_2]:
+            finger.GetCollisionModel().Clear()
+            mat = chrono.ChContactMaterialNSC()
+            mat.SetRollingFriction(0.5)
+            finger.AddCollisionShape(
+                chrono.ChCollisionShapeBox(mat, 0.005 * s, 0.13 * s, 0.01 * s),
+                chrono.ChFramed(chrono.ChVector3d(-0.106 * s, 0.08 * s, 0), chrono.QUNIT))
+
     def rotate_motor(self, motor, angle):
         if motor==self.motor_base_shoulder:
             motor.SetAngleFunction(chrono.ChFunctionConst(-angle-math.pi))
@@ -150,7 +221,7 @@ class LRV_Arm:
                 object = self.system.SearchBody(object_name)
                 dist_1 = (object.GetPos() - self.finger_1.GetPos()).Length()
                 dist_2 = (object.GetPos() - self.finger_2.GetPos()).Length()
-                if dist_1 < 0.27 and dist_2 < 0.27:
+                if dist_1 < 0.27 * self.scale and dist_2 < 0.27 * self.scale:
                     print("here")
                     lock = chrono.ChLinkLockLock()
                     lock.SetName('lock' + object.GetName())
@@ -194,11 +265,11 @@ class LRV_Arm:
 
             if not self.flag and self.object_contact_count + 1 > self.system.GetNumContacts():
                 if self.gripper_left_or_right:
-                    self.left_motor_val -= 0.02
+                    self.left_motor_val -= 0.02 * self.scale
                     self.move_linear_motor(self.motor_endoffactor_finger_1, (self.left_motor_val))
                     self.gripper_left_or_right = False
                 else:
-                    self.right_motor_val -= 0.02
+                    self.right_motor_val -= 0.02 * self.scale
                     self.move_linear_motor(self.motor_endoffactor_finger_2, -(self.right_motor_val))
                     self.gripper_left_or_right = True
             elif self.flag and self.object_contact_count + 1 > self.system.GetNumContacts():
@@ -207,10 +278,10 @@ class LRV_Arm:
                     if self.cur_object:
                         self.lock_flag = True
                 if self.gripper_left_or_right:
-                    self.left_motor_val -= 0.02
+                    self.left_motor_val -= 0.02 * self.scale
                     self.move_linear_motor(self.motor_endoffactor_finger_1, (self.left_motor_val))
                 else:
-                    self.right_motor_val -= 0.02
+                    self.right_motor_val -= 0.02 * self.scale
                     self.move_linear_motor(self.motor_endoffactor_finger_2, -(self.right_motor_val))
             else:    
                 if self.cur_object:        
