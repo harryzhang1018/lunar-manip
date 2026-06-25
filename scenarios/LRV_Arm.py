@@ -78,7 +78,7 @@ LIFT_THETA2 = math.radians(60.0)   # shoulder (theta 2) target for the lift
 LIFT_SPEED = 0.5                   # rad/s shoulder ramp
 
 
-def place_rock(system, pos, ground_z):
+def place_rock(system, pos, ground_z, contact_method=chrono.ChContactMethod_NSC):
     """Spawn the rock mesh resting on the ground beneath the gripper center `pos`.
 
     Follows the rock recipe from chrono's Curiosity demos: a scaled
@@ -87,6 +87,9 @@ def place_rock(system, pos, ground_z):
     body is placed so the mesh bounding box is centered (x, y) under `pos`
     with its bottom on the ground; the gripper, at GRAB_HEIGHT, then bites
     the rock a few cm below its top.
+
+    `contact_method` selects the rock's contact material type (NSC by default;
+    pass ChContactMethod_SMC to match an SMC system).
     """
     mesh = chrono.ChTriangleMeshConnected.CreateFromWavefrontFile(
         os.path.join(project_root, ROCK_MESH), False, True)
@@ -113,7 +116,12 @@ def place_rock(system, pos, ground_z):
     rock.SetMass(props.mass * ROCK_DENSITY)
     rock.SetInertiaXX(principal_I * ROCK_DENSITY)
 
-    mat = chrono.ChContactMaterialNSC()
+    if contact_method == chrono.ChContactMethod_SMC:
+        mat = chrono.ChContactMaterialSMC()
+        mat.SetYoungModulus(2e7)
+        mat.SetRestitution(0.01)
+    else:
+        mat = chrono.ChContactMaterialNSC()
     mat.SetFriction(0.7)
     rock.AddCollisionShape(chrono.ChCollisionShapeTriangleMesh(mat, mesh, False, False, 0.005))
     rock.EnableCollision(True)

@@ -30,7 +30,10 @@ Run with the project's conda env:
 
 Add `--headless` to step the simulation without opening a render window (used for
 smoke tests). Add `--vsg` to render with the VSG (Vulkan) backend instead of the
-default Irrlicht (OpenGL) one.
+default Irrlicht (OpenGL) one. Add `--smc` to build the whole scene with SMC
+penalty contact instead of the default NSC (complementarity) -- every contact
+material in the scene (vehicle, terrain, trailer bed, rock, gripper finger pads)
+is built to match, and a finer integration step is used.
 """
 
 import os
@@ -57,7 +60,13 @@ from LRV_Arm import place_rock
 # Initial vehicle pose and integration step.
 INIT_LOC = chrono.ChVector3d(-83, -85, 0.5)
 INIT_ROT = chrono.ChQuaterniond(1, 0, 0, 0)
-STEP_SIZE = 1e-3
+# Contact method. The scene was authored for NSC; pass --smc on the command line
+# to build everything (vehicle, terrain, trailer bed, rock, and the gripper finger
+# pads) with SMC penalty contact instead. SMC integrates with a finer step, so the
+# step size depends on the method; main() sets STEP_SIZE once the method is known.
+STEP_SIZE_NSC = 1e-3
+STEP_SIZE_SMC = 5e-4
+STEP_SIZE = STEP_SIZE_NSC
 
 # Uniform geometric scale of the gripper arm (1.0 = as exported). Forwarded to
 # both LRV_Arm and its IK solver; the grasp tuning and rock-spawn radius below
@@ -247,6 +256,7 @@ class TrailerArm(LRV_Arm):
     FINGER_CLOSE_POS = 0.145           # max finger travel from open
     FINGER_CLOSE_SPEED = 0.1           # m/s per finger
     GRIP_STALL_TOL = 0.012             # command-vs-actual lag that means "pads on rock"
+    GRIP_FORCE_TOL = 30.0              # pad contact force (N) that means "pads on rock" (SMC)
     LIFT_THETA2 = math.radians(60.0)   # shoulder (theta 2) target for the lift
     LIFT_SPEED = 0.5                   # rad/s shoulder ramp
 
@@ -375,13 +385,26 @@ class TrailerArm(LRV_Arm):
             self._stow_step()
 
     def _close_step(self):
-        """Close the fingers a notch; lock the rock once the pads stall on it."""
+        """Close the fingers a notch; lock the rock once the pads bear on it.
+
+        Two signals decide "the pads are on the rock": the position-motor lag
+        (actual separation trailing the commanded separation -- the reliable cue
+        under NSC's rigid contacts) and the pad contact force. The force cue is
+        what makes this work under SMC: there the rigid position motor would drive
+        the fingers straight through the soft penalty contact before any lag built
+        up, so closing ran to the travel stop and the rock got locked ~3 cm
+        penetrated. Whichever cue trips first parks the fingers at the rock surface
+        and locks, so the grip closes *on* the rock instead of *into* it.
+        """
         self._close_pos = min(self._close_pos + self.FINGER_CLOSE_SPEED * self.CTRL_DT,
                               self.FINGER_CLOSE_POS)
         self.move_linear_motor(self.motor_endoffactor_finger_1, -self._close_pos)
         self.move_linear_motor(self.motor_endoffactor_finger_2, self._close_pos)
         actual_sep = (self.finger_1.GetPos() - self.finger_2.GetPos()).Length()
-        stalled = actual_sep - (self.FINGER_OPEN_SEP - 2 * self._close_pos) > self.GRIP_STALL_TOL
+        lagged = actual_sep - (self.FINGER_OPEN_SEP - 2 * self._close_pos) > self.GRIP_STALL_TOL
+        pad_force = max(self.finger_1.GetContactForce().Length(),
+                       self.finger_2.GetContactForce().Length())
+        stalled = lagged or pad_force > self.GRIP_FORCE_TOL
         if stalled or self._close_pos >= self.FINGER_CLOSE_POS:
             if stalled:
                 # Park the command where the fingers actually are (plus a light 2 mm
@@ -393,7 +416,13 @@ class TrailerArm(LRV_Arm):
             self._grip_time = self.system.GetChTime()
             self.add_lock()  # lock the registered rock within range to the end-effector
             if self.cur_lock:
-                print(f"  grasp: '{self.cur_object}' locked (sep {actual_sep:.3f} m)")
+                # The rock is now rigidly fixed to the end-effector, so its contact
+                # with the pads serves no purpose and only lets the SMC penalty
+                # force keep pushing against the lock (creeping back into the rock).
+                # Turn it off; remove_lock() re-enables it when the rock is released.
+                self.system.SearchBody(self.cur_object).EnableCollision(False)
+                print(f"  grasp: '{self.cur_object}' locked "
+                      f"(sep {actual_sep:.3f} m, pad force {pad_force:.0f} N)")
             else:
                 print("  grasp: fingers closed but nothing in range to lock")
 
@@ -480,8 +509,59 @@ def sample_rock_position(base, terrain):
     return chrono.ChVector3d(tx, ty, ground_z)
 
 
-def build_scene():
+def resolve_contact_method(argv):
+    """Pick the contact method from the command line: --smc -> SMC, else NSC."""
+    return chrono.ChContactMethod_SMC if "--smc" in argv else chrono.ChContactMethod_NSC
+
+
+def make_material(contact_method, friction, restitution=0.01, young=2e7):
+    """Build a contact material of the type that matches `contact_method`.
+
+    NSC ignores Young's modulus; SMC uses it (with restitution) for its penalty
+    contact. Built via ChContactMaterialData so one call yields whichever type
+    the system needs.
+    """
+    data = chrono.ChContactMaterialData()
+    data.mu = friction
+    data.cr = restitution
+    data.Y = young
+    return data.CreateMaterial(contact_method)
+
+
+def match_gripper_contact_material(gripper, contact_method, scale):
+    """Rebuild the gripper's two finger pads with a `contact_method` material.
+
+    The arm (model/arm_model.py and the SolidWorks import) always builds NSC
+    finger pads; in an SMC system those mismatched materials would make the
+    finger-vs-rock contact fail, so rebuild them to match. The pad geometry
+    mirrors arm_model._apply_scale (a thin box, scaled by `scale`).
+    """
+    for finger in (gripper.finger_1, gripper.finger_2):
+        finger.GetCollisionModel().Clear()
+        if contact_method == chrono.ChContactMethod_SMC:
+            mat = chrono.ChContactMaterialSMC()
+            # Match the rock's stiffness (2e7). The SMC default modulus is 2e5 --
+            # 100x softer than the rock -- which let the position-driven fingers
+            # sink ~3 cm into the rock before the grip was detected. Matching the
+            # rock keeps the pads bearing on the surface, and zero restitution
+            # avoids a bounce as they bite.
+            mat.SetYoungModulus(2e7)
+            mat.SetRestitution(0.0)
+        else:
+            mat = chrono.ChContactMaterialNSC()
+        mat.SetFriction(0.7)  # same friction as the rock so the pads grip, not slide
+        finger.AddCollisionShape(
+            chrono.ChCollisionShapeBox(mat, 0.005 * scale, 0.13 * scale, 0.01 * scale),
+            chrono.ChFramed(chrono.ChVector3d(-0.106 * scale, 0.08 * scale, 0), chrono.QUNIT))
+        finger.EnableCollision(True)
+
+
+def build_scene(contact_method=chrono.ChContactMethod_NSC):
     """Create a system with the LRV vehicle, welded arm, dumping trailer, terrain, rocks.
+
+    `contact_method` (NSC by default, or SMC) selects the contact formulation for
+    the whole scene -- the vehicle/trailer, terrain, trailer bed, rocks, and the
+    gripper finger pads are all built to match.
 
     Returns (system, vehicle, trailer, terrain, gripper, dump_bed, rocks).
     """
@@ -493,7 +573,7 @@ def build_scene():
 
     # ---- Rover ----
     vehicle = veh.WheeledVehicle(veh.GetVehicleDataFile("LRV/Polaris.json"),
-                                 chrono.ChContactMethod_NSC)
+                                 contact_method)
     vehicle.Initialize(chrono.ChCoordsysd(INIT_LOC, INIT_ROT))
     vehicle.SetChassisVisualizationType(chrono.VisualizationType_MESH)
     vehicle.SetSuspensionVisualizationType(chrono.VisualizationType_PRIMITIVES)
@@ -515,6 +595,8 @@ def build_scene():
     # ---- Gripper arm welded to the back of the chassis ----
     arm_offset = vehicle.GetChassis().GetPos() + chrono.ChVector3d(-1.1, 0, 0.1)
     gripper = TrailerArm(system, arm_offset, vehicle, scale=ARM_SCALE)
+    # The arm always builds NSC finger pads; rebuild them to match an SMC system.
+    match_gripper_contact_material(gripper, contact_method, ARM_SCALE)
 
     # ---- Towed trailer hitched behind the rover ----
     trailer = veh.WheeledTrailer(system, veh.GetVehicleDataFile(TRAILER_FILE))
@@ -531,8 +613,7 @@ def build_scene():
 
     # The collidable bed surface (the trailer JSON's chassis visualization is
     # primitives only), mounted on a Y-axis dump hinge.
-    bed_mat = chrono.ChContactMaterialNSC()
-    bed_mat.SetFriction(0.7)
+    bed_mat = make_material(contact_method, friction=0.7)
     dump_bed = TrailerDumpBed(system, trailer.GetChassis().GetBody(),
                               veh.GetVehicleDataFile(TRAILER_BED_MESH),
                               TRAILER_BED_OFFSET, bed_mat)
@@ -540,9 +621,7 @@ def build_scene():
     # ---- Flat rigid patch (100 x 100 m) at ground level under the vehicle ----
     system.SetCollisionSystemType(chrono.ChCollisionSystem.Type_BULLET)
     terrain = veh.RigidTerrain(system)
-    patch_mat = chrono.ChContactMaterialNSC()
-    patch_mat.SetFriction(0.9)
-    patch_mat.SetRestitution(0.01)
+    patch_mat = make_material(contact_method, friction=0.9, restitution=0.01)
     patch = terrain.AddPatch(patch_mat,
                              chrono.ChCoordsysd(chrono.ChVector3d(INIT_LOC.x, INIT_LOC.y, 0), chrono.QUNIT),
                              100.0, 100.0)
@@ -567,7 +646,8 @@ def build_scene():
                 break     # reachable and well clear of the other rocks
         else:
             raise RuntimeError("no reachable, well-separated rock position found")
-        rock = place_rock(system, rock_pos, ground_z=rock_pos.z)
+        rock = place_rock(system, rock_pos, ground_z=rock_pos.z,
+                          contact_method=contact_method)
         rock.SetName(f"rock_{i}")  # unique name so the gripper locks the right one
         rocks.append(rock)
         placed_xy.append((rock_pos.x, rock_pos.y))
@@ -699,11 +779,17 @@ def brake_and_grasp(system, vehicle, trailer, terrain, gripper, dump_bed, rocks,
 
 
 def main():
+    global STEP_SIZE
     headless = "--headless" in sys.argv
     use_vsg = "--vsg" in sys.argv  # render with VSG (Vulkan) instead of Irrlicht
-    title = f"LRV + trailer: pick up {NUM_ROCKS} rocks and load them onto the trailer"
+    contact_method = resolve_contact_method(sys.argv)  # --smc -> SMC, else NSC
+    smc = contact_method == chrono.ChContactMethod_SMC
+    STEP_SIZE = STEP_SIZE_SMC if smc else STEP_SIZE_NSC  # SMC wants a finer step
+    method_name = "SMC" if smc else "NSC"
+    title = (f"LRV + trailer ({method_name}): pick up {NUM_ROCKS} rocks and "
+             f"load them onto the trailer")
     print(f"=== {title} (headless smoke test) ===" if headless else f"=== {title} ===")
-    system, vehicle, trailer, terrain, gripper, dump_bed, rocks = build_scene()
+    system, vehicle, trailer, terrain, gripper, dump_bed, rocks = build_scene(contact_method)
     arm_base = gripper.base.GetPos()
     print(f"  arm base   : {arm_base}")
     for rock in rocks:
