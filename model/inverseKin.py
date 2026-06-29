@@ -10,7 +10,12 @@ class RobotArmInverseKinematicsSolver:
         ``scale`` must match the geometric scale passed to ``LRV_Arm`` so the
         link lengths used here line up with the simulated arm.
         """
-        self.a1, self.a2, self.a3 , self.a4 = (v * scale for v in (0.32516, 1.27, 1.143, 0.3052))
+        # Link lengths measured from the imported arm's joint markers (a1 = shoulder
+        # pivot height, a2 = bicep, a3 = forearm, a4 = wrist joint -> gripper centre).
+        # a4 was 0.3052 but the real wrist->gripper-centre distance is ~0.358; the
+        # gap was multiplied by `scale`, so a scaled-up arm reached short of its
+        # target. Corrected here so the IK aims at the true gripper centre.
+        self.a1, self.a2, self.a3 , self.a4 = (v * scale for v in (0.32516, 1.27, 1.143, 0.3577))
     # Define the forward kinematics equations for the robot arm
     def forward_kinematics(self, theta):
         theta1, theta2, theta3, theta4 = theta

@@ -23,8 +23,9 @@ class LRV_Arm:
         # self.rotate_motor(self.motor_shoulder_biceps, 0)
         # self.rotate_motor(self.motor_biceps_elbow, 0)
         # self.rotate_motor(self.motor_elbow_eef, 0)
-        self.move_linear_motor(self.motor_endoffactor_finger_1, -0.15*self.scale)
-        self.move_linear_motor(self.motor_endoffactor_finger_2, 0.15*self.scale)
+        # Fingers are not scaled (see _apply_scale), so the open pose is 1x too.
+        self.move_linear_motor(self.motor_endoffactor_finger_1, -0.15)
+        self.move_linear_motor(self.motor_endoffactor_finger_2, 0.15)
         
         # self._setup_locks()
 
@@ -142,7 +143,7 @@ class LRV_Arm:
         self.cur_lock = None
         self.cur_object = None
         self.object_contact_count = None
-        self.motor_val = 0.058 * self.scale
+        self.motor_val = 0.058
 
         self.gripper_left_or_right = True
         self.flag = False
@@ -165,20 +166,36 @@ class LRV_Arm:
             body.SetRot(rot * body.GetRot())
 
     def _apply_scale(self):
-        """Uniformly scale the arm geometry by self.scale about the model origin.
+        """Uniformly scale the arm links by self.scale about the model origin.
 
-        Scales link placements (REF frames), COM offsets, visual meshes, joint
-        marker positions, and the finger contact pads. Mass and inertia are left
-        unchanged (geometric scaling only); rotations are scale-invariant. Must
-        run after the bodies/markers are imported but before the motors/locks are
-        created, so the joint frames are built at the scaled positions.
+        Scales link placements (REF frames), COM offsets, visual meshes, and joint
+        marker positions. Mass and inertia are left unchanged (geometric scaling
+        only); rotations are scale-invariant. Must run after the bodies/markers are
+        imported but before the motors/locks are created, so the joint frames are
+        built at the scaled positions.
+
+        The two gripper fingers are deliberately NOT scaled: the objects to grasp
+        are a fixed small size, so a scaled-up gripper could not pick them up. The
+        fingers keep their imported (1x) geometry, COM offset and contact pads, and
+        are merely translated so their midpoint lands where a fully scaled gripper's
+        would (s x the original midpoint) -- i.e. at the tip of the scaled-out
+        end-effector. That keeps the IK (which scales every link) aimed at the real
+        gripper centre, with the opening, travel and contact pads left at 1x. The
+        finger linear motors impose a relative displacement in absolute metres, so
+        leaving the finger geometry at 1x keeps the open/close travel correct too.
         """
         s = self.scale
         if s == 1.0:
             return
 
+        # Shift the unscaled fingers so their COM midpoint lands at s x its original
+        # value -- exactly where a fully scaled gripper centre would sit, so the
+        # scaled-link IK still aims at the real gripper centre.
+        finger_mid = (self.finger_1.GetPos() + self.finger_2.GetPos()) * 0.5
+        finger_shift = finger_mid * (s - 1.0)
+
         bodies = [self.base, self.shoulder, self.biceps, self.elbow,
-                  self.wrist, self.endoffactor, self.finger_1, self.finger_2]
+                  self.wrist, self.endoffactor]
         for body in bodies:
             aux = chrono.CastToChBodyAuxRef(body)
             ref = aux.GetFrameRefToAbs()
@@ -218,14 +235,13 @@ class LRV_Arm:
             marker.ImposeAbsoluteTransform(
                 chrono.ChFramed(marker.GetPos() * s, marker.GetRot()))
 
-        # The imported finger contact pads have fixed dimensions; rebuild scaled.
+        # Carry the (unscaled) fingers out to the scaled end-effector. Only their
+        # placement moves; size, COM offset and the imported contact pads stay 1x.
         for finger in [self.finger_1, self.finger_2]:
-            finger.GetCollisionModel().Clear()
-            mat = chrono.ChContactMaterialNSC()
-            mat.SetRollingFriction(0.5)
-            finger.AddCollisionShape(
-                chrono.ChCollisionShapeBox(mat, 0.005 * s, 0.13 * s, 0.01 * s),
-                chrono.ChFramed(chrono.ChVector3d(-0.106 * s, 0.08 * s, 0), chrono.QUNIT))
+            aux = chrono.CastToChBodyAuxRef(finger)
+            ref = aux.GetFrameRefToAbs()
+            aux.SetFrameRefToAbs(
+                chrono.ChFramed(ref.GetPos() + finger_shift, ref.GetRot()))
 
     def rotate_motor(self, motor, angle):
         if motor==self.motor_base_shoulder:
@@ -263,7 +279,8 @@ class LRV_Arm:
                 object = self.system.SearchBody(object_name)
                 dist_1 = (object.GetPos() - self.finger_1.GetPos()).Length()
                 dist_2 = (object.GetPos() - self.finger_2.GetPos()).Length()
-                if dist_1 < 0.27 * self.scale and dist_2 < 0.27 * self.scale:
+                # Fingers stay 1x size, so the lock-proximity gate is unscaled too.
+                if dist_1 < 0.27 and dist_2 < 0.27:
                     print("here")
                     lock = chrono.ChLinkLockLock()
                     lock.SetName('lock' + object.GetName())
@@ -307,11 +324,11 @@ class LRV_Arm:
 
             if not self.flag and self.object_contact_count + 1 > self.system.GetNumContacts():
                 if self.gripper_left_or_right:
-                    self.left_motor_val -= 0.02 * self.scale
+                    self.left_motor_val -= 0.02
                     self.move_linear_motor(self.motor_endoffactor_finger_1, (self.left_motor_val))
                     self.gripper_left_or_right = False
                 else:
-                    self.right_motor_val -= 0.02 * self.scale
+                    self.right_motor_val -= 0.02
                     self.move_linear_motor(self.motor_endoffactor_finger_2, -(self.right_motor_val))
                     self.gripper_left_or_right = True
             elif self.flag and self.object_contact_count + 1 > self.system.GetNumContacts():
@@ -320,10 +337,10 @@ class LRV_Arm:
                     if self.cur_object:
                         self.lock_flag = True
                 if self.gripper_left_or_right:
-                    self.left_motor_val -= 0.02 * self.scale
+                    self.left_motor_val -= 0.02
                     self.move_linear_motor(self.motor_endoffactor_finger_1, (self.left_motor_val))
                 else:
-                    self.right_motor_val -= 0.02 * self.scale
+                    self.right_motor_val -= 0.02
                     self.move_linear_motor(self.motor_endoffactor_finger_2, -(self.right_motor_val))
             else:    
                 if self.cur_object:        

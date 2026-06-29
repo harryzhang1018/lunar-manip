@@ -254,22 +254,24 @@ class TrailerArm(LRV_Arm):
     CTRL_DT = 0.01
     FINGER_OPEN_SEP = 0.388            # finger COM separation at open (motor pos 0)
     FINGER_CLOSE_POS = 0.145           # max finger travel from open
+    FINGER_CLOSED_SEP = FINGER_OPEN_SEP - 2.0 * FINGER_CLOSE_POS
+    FINGER_GRASP_SEP = 0.26            # scale-1 gap where contact may count as a grasp
     FINGER_CLOSE_SPEED = 0.1           # m/s per finger
-    GRIP_STALL_TOL = 0.012             # command-vs-actual lag that means "pads on rock"
+    GRIP_STALL_TOL = 0.012             # retained for the older NSC close heuristic
     GRIP_FORCE_TOL = 30.0              # pad contact force (N) that means "pads on rock" (SMC)
+    LOCK_FINGER_DIST = 0.27            # must match LRV_Arm.add_lock()'s 1x finger gate
     LIFT_THETA2 = math.radians(60.0)   # shoulder (theta 2) target for the lift
     LIFT_SPEED = 0.5                   # rad/s shoulder ramp
 
-    def __init__(self, system, pos, attached_vehicle=None, ik_solver=None, scale=1.0):
-        super().__init__(system, pos, attached_vehicle, scale=scale)
+    def __init__(self, system, pos, attached_vehicle=None, ik_solver=None, scale=1.0,
+                 mount_rot=None):
+        super().__init__(system, pos, attached_vehicle, scale=scale, mount_rot=mount_rot)
         self.attached_vehicle = attached_vehicle
         self.ik_solver = ik_solver or RobotArmInverseKinematicsSolver(scale=scale)
-        # Geometric tuning scales with the arm; angles, times, and rad/s speeds do
-        # not. These shadow the class constants of the same name.
-        for attr in ("GRAB_HEIGHT", "GRASP_REACH_TOL", "PLACE_TOL",
-                     "FINGER_OPEN_SEP", "FINGER_CLOSE_POS",
-                     "FINGER_CLOSE_SPEED", "GRIP_STALL_TOL"):
-            setattr(self, attr, getattr(self, attr) * scale)
+        # IK link lengths scale with the arm, but the rocks and fingers stay 1x
+        # (see LRV_Arm._apply_scale). Keep the grasp height, reach gate, finger
+        # separation envelope, and lock threshold in absolute metres so a scaled
+        # arm does not make the small gripper behave like it was scaled too.
         self._grasp_target = None
         self._grasp_done = True
         self._place_pos = None
@@ -283,7 +285,14 @@ class TrailerArm(LRV_Arm):
         base = self.base.GetPos()
         vir_base = chrono.ChBody()
         vir_base.SetPos(base)
-        vir_base.SetRot(self.attached_vehicle.GetChassisBody().GetRot())  # arm-base frame
+        # Arm-base frame: the chassis orientation, composed with the arm's mount
+        # rotation when it was welded on at an angle (mount_rot). The arm's links
+        # live in that rotated frame, so the IK must solve there -- otherwise a
+        # re-mounted (e.g. 180-deg-yaw) arm reaches to the mirror-image point.
+        base_rot = self.attached_vehicle.GetChassisBody().GetRot()
+        if self.mount_rot is not None:
+            base_rot = base_rot * self.mount_rot
+        vir_base.SetRot(base_rot)
         des = vir_base.TransformPointParentToLocal(world_point)
         with contextlib.redirect_stdout(io.StringIO()):  # hush solver chatter
             return self.ik_solver.inverse_kinematics_solver([des.x, des.y, des.z],
@@ -320,6 +329,7 @@ class TrailerArm(LRV_Arm):
         self._lifted = self._placed = False
         self._grasp_done = False
         self._close_pos = 0.0
+        self._contact_seen = False
         self._grip_time = None
         self._lift_angle = None
         self._place_theta = None
@@ -387,34 +397,48 @@ class TrailerArm(LRV_Arm):
     def _close_step(self):
         """Close the fingers a notch; lock the rock once the pads bear on it.
 
-        Two signals decide "the pads are on the rock": the position-motor lag
-        (actual separation trailing the commanded separation -- the reliable cue
-        under NSC's rigid contacts) and the pad contact force. The force cue is
-        what makes this work under SMC: there the rigid position motor would drive
-        the fingers straight through the soft penalty contact before any lag built
-        up, so closing ran to the travel stop and the rock got locked ~3 cm
-        penetrated. Whichever cue trips first parks the fingers at the rock surface
-        and locks, so the grip closes *on* the rock instead of *into* it.
+        Contact force is the close trigger, but the scale-1 finger separation is
+        still the allowed close range even when the arm links are scaled up. Once
+        pad force has been seen on the target and the finger gap reaches that 1x
+        grasp range, lock the rock before further closing can push it away.
         """
         self._close_pos = min(self._close_pos + self.FINGER_CLOSE_SPEED * self.CTRL_DT,
                               self.FINGER_CLOSE_POS)
         self.move_linear_motor(self.motor_endoffactor_finger_1, -self._close_pos)
         self.move_linear_motor(self.motor_endoffactor_finger_2, self._close_pos)
         actual_sep = (self.finger_1.GetPos() - self.finger_2.GetPos()).Length()
-        lagged = actual_sep - (self.FINGER_OPEN_SEP - 2 * self._close_pos) > self.GRIP_STALL_TOL
         pad_force = max(self.finger_1.GetContactForce().Length(),
                        self.finger_2.GetContactForce().Length())
-        stalled = lagged or pad_force > self.GRIP_FORCE_TOL
-        if stalled or self._close_pos >= self.FINGER_CLOSE_POS:
-            if stalled:
+        target_lockable = self._target_in_lock_range()
+        in_1x_grasp_range = actual_sep <= self.FINGER_GRASP_SEP
+        if target_lockable and pad_force > self.GRIP_FORCE_TOL:
+            self._contact_seen = True
+        # Contact force is required to arm the lock. The 1x gap only decides when
+        # an already force-triggered grasp is close enough to stop.
+        contact_ready = self._contact_seen and target_lockable and in_1x_grasp_range
+        fully_closed = self._close_pos >= self.FINGER_CLOSE_POS
+        if contact_ready or fully_closed:
+            if contact_ready:
                 # Park the command where the fingers actually are (plus a light 2 mm
                 # bite) so the position motors hold the rock instead of crushing it.
                 self._close_pos = (self.FINGER_OPEN_SEP - actual_sep) / 2.0 + 0.002
                 self.move_linear_motor(self.motor_endoffactor_finger_1, -self._close_pos)
                 self.move_linear_motor(self.motor_endoffactor_finger_2, self._close_pos)
+            self.add_lock()  # lock the registered rock within range to the end-effector
+            if not self.cur_lock and not fully_closed:
+                # One pad can touch first while the arm is still centering over the
+                # rock. Keep closing instead of consuming the grasp on that one-sided
+                # SMC force spike.
+                return
+            if not self.cur_lock:
+                print("  grasp: fingers reached the 1x close range but nothing locked "
+                      "-- reopening and retrying")
+                self.open()
+                self._closing = False
+                self._close_pos = 0.0
+                return
             self._gripped = True
             self._grip_time = self.system.GetChTime()
-            self.add_lock()  # lock the registered rock within range to the end-effector
             if self.cur_lock:
                 # The rock is now rigidly fixed to the end-effector, so its contact
                 # with the pads serves no purpose and only lets the SMC penalty
@@ -423,8 +447,14 @@ class TrailerArm(LRV_Arm):
                 self.system.SearchBody(self.cur_object).EnableCollision(False)
                 print(f"  grasp: '{self.cur_object}' locked "
                       f"(sep {actual_sep:.3f} m, pad force {pad_force:.0f} N)")
-            else:
-                print("  grasp: fingers closed but nothing in range to lock")
+
+    def _target_in_lock_range(self):
+        """Whether the current target rock is close enough for add_lock() to succeed."""
+        if self._grasp_target is None:
+            return False
+        target_pos = self._grasp_target.GetPos()
+        return ((target_pos - self.finger_1.GetPos()).Length() < self.LOCK_FINGER_DIST
+                and (target_pos - self.finger_2.GetPos()).Length() < self.LOCK_FINGER_DIST)
 
     def _lift_step(self):
         """Ramp the shoulder (theta 2) up to LIFT_THETA2 to lift the rock."""
@@ -528,13 +558,15 @@ def make_material(contact_method, friction, restitution=0.01, young=2e7):
     return data.CreateMaterial(contact_method)
 
 
-def match_gripper_contact_material(gripper, contact_method, scale):
+def match_gripper_contact_material(gripper, contact_method, scale=1.0):
     """Rebuild the gripper's two finger pads with a `contact_method` material.
 
     The arm (model/arm_model.py and the SolidWorks import) always builds NSC
     finger pads; in an SMC system those mismatched materials would make the
-    finger-vs-rock contact fail, so rebuild them to match. The pad geometry
-    mirrors arm_model._apply_scale (a thin box, scaled by `scale`).
+    finger-vs-rock contact fail, so rebuild them to match. The pad geometry is the
+    imported (1x) thin box -- the fingers are deliberately not scaled with the arm
+    (see LRV_Arm._apply_scale), so they can still grasp the fixed-size rocks. The
+    `scale` argument is retained for call-site symmetry but no longer applied.
     """
     for finger in (gripper.finger_1, gripper.finger_2):
         finger.GetCollisionModel().Clear()
@@ -551,8 +583,8 @@ def match_gripper_contact_material(gripper, contact_method, scale):
             mat = chrono.ChContactMaterialNSC()
         mat.SetFriction(0.7)  # same friction as the rock so the pads grip, not slide
         finger.AddCollisionShape(
-            chrono.ChCollisionShapeBox(mat, 0.005 * scale, 0.13 * scale, 0.01 * scale),
-            chrono.ChFramed(chrono.ChVector3d(-0.106 * scale, 0.08 * scale, 0), chrono.QUNIT))
+            chrono.ChCollisionShapeBox(mat, 0.005, 0.13, 0.01),
+            chrono.ChFramed(chrono.ChVector3d(-0.106, 0.08, 0), chrono.QUNIT))
         finger.EnableCollision(True)
 
 
