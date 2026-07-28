@@ -117,19 +117,26 @@ class LRV_Arm:
         self.finger_2.EnableCollision(True)
         
         if attached_vehicle:
-            # Weld the arm base to the chassis. Mount the base at `pos`, then (if
-            # requested) re-orient the whole arm about that point before locking.
+            # Weld the arm base to the chassis. Mount the base at `pos`, then
+            # re-orient the whole arm about that point before locking.
             self.base.SetPos(pos)
-            if mount_rot is None:
-                lock_frame = chrono.ChFramed(pos, chrono.QUNIT)
-            else:
-                # Rotate the ENTIRE arm as one rigid block about the mount point.
-                # The joint motors/locks captured their relative frames at init,
-                # so they stay satisfied only if every connected body moves
-                # together; rotating just the base would leave the rest of the arm
-                # behind and the solver would snap it into place at the first step.
-                self._rotate_assembly(mount_rot, pos)
-                lock_frame = chrono.ChFramed(self.base.GetPos(), self.base.GetRot())
+            # `mount_rot` is CHASSIS-relative, so the arm's world orientation is
+            # the chassis heading composed with it. Composing the chassis rotation
+            # here (rather than applying mount_rot alone) is what lets the arm ride
+            # correctly on a vehicle initialized at a non-zero heading, and it
+            # matches the frame the grasp IK solves in (chassis_rot * mount_rot,
+            # see TrailerArm._ik_to). For a vehicle spawned at identity heading
+            # this is exactly mount_rot, as before.
+            world_rot = attached_vehicle.GetChassisBody().GetRot()
+            if mount_rot is not None:
+                world_rot = world_rot * mount_rot
+            # Rotate the ENTIRE arm as one rigid block about the mount point.
+            # The joint motors/locks captured their relative frames at init,
+            # so they stay satisfied only if every connected body moves
+            # together; rotating just the base would leave the rest of the arm
+            # behind and the solver would snap it into place at the first step.
+            self._rotate_assembly(world_rot, pos)
+            lock_frame = chrono.ChFramed(self.base.GetPos(), self.base.GetRot())
             lock = chrono.ChLinkLockLock()
             lock.Initialize(attached_vehicle.GetChassisBody(), self.base, lock_frame)
             self.system.Add(lock)

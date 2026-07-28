@@ -245,9 +245,17 @@ class TrailerArm(LRV_Arm):
     T_CLOSE_TIMEOUT = 8.0   # ...or after this long (fallback if it never quite arrives)
     LIFT_DELAY = 1.5        # lift this long after the rock is gripped
     PLACE_TOL = 0.15        # release once the gripper is this close to the drop point
+    # ...and, if set, moving no faster than this (m/s), so the rock is set down
+    # rather than thrown. Infinite = release as soon as the point is reached, at
+    # whatever speed (the historical behaviour, fine when rocks go on one pile).
+    PLACE_SPEED_TOL = float("inf")
     T_PLACE_MOVE = 6.0      # ...or after this long, whichever comes first (timeout)
     STOW_THETA = (-math.pi, math.pi / 5, math.pi / 4 , 0.0)  # home pose [t1,t2,t3,t4] after a place
     STOW_DELAY = 1.0        # hold over the bed this long after releasing (rock settles) before stowing
+    # Shoulder angle to raise to before slewing home, and how long to give it.
+    # None = slew straight to STOW_THETA from wherever the place pose left the arm.
+    STOW_LIFT_THETA2 = None
+    STOW_LIFT_TIME = 1.0
     T_STOW = 2.0            # hold the stow pose this long, then the grasp is done
 
     # Finger-close + lift tuning (identical to LRV_Arm.py).
@@ -336,6 +344,7 @@ class TrailerArm(LRV_Arm):
         self._place_t0 = None
         self._release_time = None
         self._stow_t0 = None
+        self._stow_lifted = False
         self._next_tick = 0.0
         # World point the gripper must reach before closing (GRAB_HEIGHT above the rock).
         self._grab_target = chrono.ChVector3d(rock.GetPos().x, rock.GetPos().y, self.GRAB_HEIGHT)
@@ -493,9 +502,16 @@ class TrailerArm(LRV_Arm):
             print(f"  place: moving gripper to {self._place_pos}")
         else:
             # Release once the gripper actually reaches the drop point (the base may
-            # have to swing most of the way around), or after a timeout.
+            # have to swing most of the way around), or after a timeout. With
+            # PLACE_SPEED_TOL set, the gripper must also have slowed to that speed:
+            # the base can swing through the drop point at several m/s, and a rock
+            # let go mid-swing flies on and lands ~0.8 m past the point. That does
+            # not matter when every rock is dropped on the same pile, but it does
+            # when each rock has its own target (see TrackedVeh_OrbitBuilder).
             gripper_center = (self.finger_1.GetPos() + self.finger_2.GetPos()) * 0.5
-            reached = (gripper_center - self._place_pos).Length() < self.PLACE_TOL
+            gripper_vel = (self.finger_1.GetPosDt() + self.finger_2.GetPosDt()) * 0.5
+            reached = ((gripper_center - self._place_pos).Length() < self.PLACE_TOL
+                       and gripper_vel.Length() < self.PLACE_SPEED_TOL)
             if reached or self.system.GetChTime() - self._place_t0 > self.T_PLACE_MOVE:
                 self.open()  # releases the fingers AND removes the lock constraint
                 self._placed = True  # stow phase runs next
@@ -505,9 +521,24 @@ class TrailerArm(LRV_Arm):
 
     def _stow_step(self):
         """Hold over the bed briefly so the rock settles, then return the arm to the
-        home pose (STOW_THETA), hold T_STOW, and finish."""
+        home pose (STOW_THETA), hold T_STOW, and finish.
+
+        With STOW_LIFT_THETA2 set, the shoulder is raised first and the base is
+        only slewed home once the gripper is clear: the swing from the (low) place
+        pose to the home pose otherwise drags the open fingers sideways through the
+        spot the rock was just set down on, and punts it several metres. That does
+        not matter when the rocks go on one pile, but it wrecks a wall built of
+        individually placed rocks (see TrackedVeh_OrbitBuilder).
+        """
         if self.system.GetChTime() - self._release_time < self.STOW_DELAY:
             return  # keep holding the place pose so the dropped rock settles first
+        if self.STOW_LIFT_THETA2 is not None and not self._stow_lifted:
+            self.rotate_motor(self.motor_shoulder_biceps, self.STOW_LIFT_THETA2)
+            if (self.system.GetChTime() - self._release_time
+                    < self.STOW_DELAY + self.STOW_LIFT_TIME):
+                return  # still lifting clear of the placed rock
+            self._stow_lifted = True
+            print("  stow: lifted clear of the placed rock")
         if self._stow_t0 is None:
             self._stow_t0 = self.system.GetChTime()
             self.rotate_motor(self.motor_base_shoulder, self.STOW_THETA[0])
