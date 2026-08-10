@@ -44,6 +44,18 @@ hands back rock poses for those upper layers -- scenery the caller spawns fixed
 and collision-free rather than rocks the gripper carries.
 `plan_layers_from_state` is the two of them in one call, straight off the CSVs.
 
+`SlopedWallStacker` is the other way to get a wall, and the one the scenarios use
+now. It does not measure anything: the wall is laid out where it is told, on the
+wall orbit, so no rocks need to have been placed first. What it adds is the shape
+-- dumped rubble stands at its slip angle, so the wall it builds has a triangular
+cross-section (`WallProfile`) rather than the straight-sided stack `layer_poses`
+makes, and every course it lays is narrower than the one below. `grow()` is
+callable over and over: each call raises the crest and widens the base by the
+same ratio, holding the slope constant, and hands back just the rocks that new
+profile adds -- a shell over what is already standing. A wall therefore comes up
+in dumps, at a fixed slope, exactly as tipping more rock onto a pile would build
+it.
+
 Standalone (prints the plan for the default site, no simulation):
 
     conda run -n chrono python scenarios/orbit_planning.py
@@ -65,9 +77,13 @@ import random
 import pychrono as chrono
 
 # Default site geometry (m). The wall is the ring being built; the builders ride
-# an orbit 3 m outside it, and the fetchers unload rocks a further ~2 m out.
+# an orbit 3.4 m outside it, and the fetchers unload rocks a further ~1.6 m out.
+# The builder separation is set by the widest wall the site builds: a finished
+# crest on a constant slope spreads its base half its height / slope either side of
+# the wall orbit, and the builder has to park clear of that with its tracks. See
+# TrackedVeh_OrbitBuilder.VEHICLE_RADIUS for the measurements behind 3.4.
 WALL_RADIUS = 30.0
-VEHICLE_RADIUS = 33.0
+VEHICLE_RADIUS = 33.4
 UNLOAD_RADIUS = 35.0
 
 # Default place-point assignment for one parked builder.
@@ -85,6 +101,28 @@ LAYER_RISE = 0.26
 # Default file names a scenario run writes its end state to.
 ROCK_STATE_FILE = "rock_state.csv"
 SITE_PLAN_FILE = "site_plan.csv"
+
+# ---- sloped wall stacking (see WallProfile / SlopedWallStacker) ----
+# Slope of the wall's faces, as the ratio height / base-half-width. It is the
+# tangent of the angle the face makes with the ground, so 0.8 is a 38.7 deg face
+# -- about what dumped angular rubble stands at. This ratio is the invariant the
+# stack is built around: every call that grows the wall raises the crest and
+# widens the base together, so H/R never changes and the cross-section stays the
+# same triangle, just bigger.
+WALL_SLOPE = 0.8
+# Vertical spacing (m) between courses of rock centres. Well under a rock height
+# (~0.26 m) on purpose, so consecutive courses overlap and knit into a solid face
+# instead of reading as separate shelves.
+WALL_COURSE_RISE = 0.10
+# Rocks per m^2 of course footprint. With the rise above this works out at ~240
+# rocks/m^3, i.e. about one rock volume per rock -- dense enough that the faces
+# read solid.
+WALL_COURSE_DENSITY = 24.0
+# Re-sample a rock landing within this distance (m) of one already in the same
+# course. Under the ~0.2 m rock width, so rocks knit rather than tile.
+WALL_MIN_SEP = 0.08
+WALL_TILT_DEG = 15.0      # max tilt off vertical of a stand-in rock
+WALL_GROWTH_RISE = 0.30   # default crest rise (m) added by one grow() call
 
 
 def _number(value):
@@ -383,7 +421,7 @@ class OrbitPlanner:
         the gripper through another N pick-and-place cycles per layer: the builder
         lays the ground layer for real, this generates the layers above it, and the
         caller spawns them fixed and collision-free (see
-        `TrackedVeh_OrbitBuilder.add_fake_layers`). They are scenery, not physics.
+        `TrackedVeh_OrbitBuilder.spawn_wall_rocks`). They are scenery, not physics.
 
         Each layer re-samples the *measured distribution* rather than copying the
         rocks below: `rocks_per_layer` (default: as many as the belt holds)
@@ -485,6 +523,349 @@ class OrbitPlanner:
         return "\n".join(lines)
 
 
+class WallProfile:
+    """The cross-section of a length of wall standing at a constant slope.
+
+    A dumped-rock wall does not stand up as a box; it stands at its slip angle,
+    so its cross-section is a triangle. This is that triangle, in the plane cut
+    radially through the site: a base of half-width `half_width` centred on the
+    wall orbit (`r_center`), faces rising at `slope`, and therefore a crest at
+
+        height = slope * half_width
+
+    `slope` is the invariant. It is height over base half-width -- the tangent of
+    the face angle -- and it is what `SlopedWallStacker.grow` holds fixed: a wall
+    that gets taller gets proportionally wider, because rubble cannot do anything
+    else. Pick `half_width` or `height`; the slope fixes the other.
+
+    Along the wall the shape is a hipped ridge, not a prism. `ridge_half_length`
+    is the half-length (m of arc) of the crest line, which is the wall being
+    built and does not move; the base runs `half_width` beyond it at each end,
+    since the ends slump at the same slope as the faces. So at height z above the
+    base every horizontal dimension is pulled in by the same `inset(z)`, and the
+    footprint is a rectangle in (radial offset, arc offset) shrinking uniformly
+    from base to ridge.
+
+    Heights are of rock *centres*, which is what `SlopedWallStacker` samples and
+    what `OrbitPlanner.measure_belt` measures. Actual rock bodies stick out about
+    half a rock beyond the profile in every direction.
+    """
+
+    def __init__(self, r_center, theta_center_deg, ridge_half_length,
+                 half_width, slope=WALL_SLOPE, base_z=0.0):
+        if half_width < 0.0:
+            raise ValueError(f"half_width must be >= 0 (got {half_width})")
+        if slope <= 0.0:
+            raise ValueError(f"slope must be > 0 (got {slope})")
+        self.r_center = r_center
+        self.theta_center_deg = theta_center_deg
+        self.ridge_half_length = ridge_half_length
+        self.half_width = half_width
+        self.slope = slope
+        self.base_z = base_z
+
+    # ---- derived geometry ----
+    @property
+    def height(self):
+        """Crest height (m) above the base -- `slope` * `half_width`."""
+        return self.slope * self.half_width
+
+    @property
+    def crest_z(self):
+        """World height (m) of the crest line."""
+        return self.base_z + self.height
+
+    @property
+    def face_angle_deg(self):
+        """Angle (deg) the faces make with the ground."""
+        return math.degrees(math.atan(self.slope))
+
+    @property
+    def base_half_length(self):
+        """Half-length (m of arc) of the footprint at the base."""
+        return self.ridge_half_length + self.half_width
+
+    def inset(self, z):
+        """How far in (m) the wall is pulled from its base outline at height `z`."""
+        return (z - self.base_z) / self.slope
+
+    def footprint_at(self, z):
+        """(radial half-width, arc half-length) in m at height `z`, or (0, 0).
+
+        Both shrink by `inset(z)`; above the crest there is no wall left.
+        """
+        half_width = self.half_width - self.inset(z)
+        if half_width < 0.0:
+            return 0.0, 0.0
+        return half_width, self.ridge_half_length + half_width
+
+    def theta_span_deg(self, z=None):
+        """Angular span (deg) of the footprint at height `z` (default: the base)."""
+        half_length = (self.base_half_length if z is None
+                       else self.footprint_at(z)[1])
+        return 2.0 * math.degrees(half_length / self.r_center)
+
+    def volume(self):
+        """Volume (m^3) enclosed by the profile -- a hipped wedge.
+
+        A prism of triangular section along the ridge, plus the two end hips,
+        which together make a pyramid: 2*L*R*H/2 + 4*R*R*H/3... in the flat
+        approximation that ignores the arc's curvature, which is under 1% here.
+        """
+        r, h, ell = self.half_width, self.height, self.ridge_half_length
+        return 2.0 * ell * r * h + 4.0 * r * r * h / 3.0
+
+    def contains(self, u, s, z):
+        """Is the point at radial offset `u`, arc offset `s`, height `z` inside?"""
+        half_width, half_length = self.footprint_at(z)
+        return abs(u) <= half_width and abs(s) <= half_length
+
+    def grown(self, half_width=None, height=None):
+        """A copy of this profile scaled up to `half_width` (or to `height`).
+
+        The slope, the ridge line and the base plane all carry over, so the new
+        profile is the same triangle enlarged about the base of the ridge.
+        """
+        if (half_width is None) == (height is None):
+            raise ValueError("pass exactly one of half_width, height")
+        if height is not None:
+            half_width = height / self.slope
+        return WallProfile(self.r_center, self.theta_center_deg,
+                           self.ridge_half_length, half_width, self.slope,
+                           self.base_z)
+
+    def describe(self):
+        """Multi-line summary of the profile."""
+        return "\n".join([
+            f"wall profile: r={self.r_center:.2f} m, theta={self.theta_center_deg:+.2f} deg, "
+            f"slope {self.slope:.2f} ({self.face_angle_deg:.1f} deg faces)",
+            f"  section: {2 * self.half_width:.2f} m wide at the base -> "
+            f"{self.height:.2f} m high (crest z={self.crest_z:.2f} m)",
+            f"  along  : {2 * self.ridge_half_length:.2f} m of ridge, "
+            f"{2 * self.base_half_length:.2f} m of base "
+            f"({self.theta_span_deg():.2f} deg of orbit)",
+            f"  volume : {self.volume():.2f} m^3",
+        ])
+
+
+class SlopedWallStacker:
+    """Builds a constant-slope wall out of stand-in rocks, one dump at a time.
+
+    The wall is *prescribed*, not measured: it is laid out on the wall orbit at
+    the station and arc it is told, so it does not depend on anything having been
+    built first (contrast `OrbitPlanner.measure_belt` + `layer_poses`, which fit
+    the stack to a belt of real rocks a gripper laid). Nothing here touches a
+    simulation -- it hands back rock poses, and the caller spawns bodies at them.
+
+    `grow()` is callable as many times as you like, and that is the point. Each
+    call enlarges the wall to a new `WallProfile` -- crest higher, base wider, the
+    slope between them unchanged -- and returns *only the rocks that new profile
+    needs and the old one did not*, grouped by course. So a wall is built up in
+    dumps:
+
+        stacker = SlopedWallStacker(planner, theta_center_deg=90.0,
+                                    ridge_half_length=2.6)
+        profile, courses = stacker.grow(height=0.6)   # -> R=0.75 m, H=0.60 m
+        profile, courses = stacker.grow()             # -> R=1.12 m, H=0.90 m
+        profile, courses = stacker.grow(height=1.2)   # -> R=1.50 m, H=1.20 m
+
+    and each call's rocks are laid on and around what is already standing rather
+    than replacing it. Since a bigger triangle contains the smaller one, the new
+    rocks are exactly the shell between the two profiles: a skin over the faces
+    and a cap over the crest. That is also what makes repeated growth cheap --
+    only the first call fills a solid section.
+
+    Courses are horizontal planes of rock centres `rise` apart, starting half a
+    rise above the base. Each gets `density` rocks per m^2 of its own footprint,
+    so the rock is spread evenly through the section and the courses narrow as
+    they climb. Rotations are a random yaw plus up to `tilt_deg` of tilt, so the
+    faces do not read as one rock stamped out N times.
+
+    `seed` makes a whole build reproducible; the draw uses its own RNG so it does
+    not disturb the caller's `random` stream. Note that the stream carries across
+    calls -- growing in two steps does not give the same rocks as growing to the
+    same profile in one.
+    """
+
+    def __init__(self, planner, theta_center_deg, ridge_half_length=None,
+                 ridge_span_deg=None, r_center=None, base_z=None,
+                 slope=WALL_SLOPE, rise=WALL_COURSE_RISE,
+                 density=WALL_COURSE_DENSITY, min_sep=WALL_MIN_SEP,
+                 tilt_deg=WALL_TILT_DEG, growth_rise=WALL_GROWTH_RISE,
+                 seed=None, max_attempts=200):
+        self.planner = planner
+        self.r_center = planner.wall_radius if r_center is None else r_center
+        self.theta_center_deg = theta_center_deg
+        if (ridge_half_length is None) == (ridge_span_deg is None):
+            raise ValueError("pass exactly one of ridge_half_length, ridge_span_deg")
+        if ridge_half_length is None:
+            ridge_half_length = 0.5 * math.radians(ridge_span_deg) * self.r_center
+        self.rise = rise
+        self.density = density
+        self.min_sep = min_sep
+        self.tilt_deg = tilt_deg
+        self.growth_rise = growth_rise
+        self.max_attempts = max_attempts
+        self._rng = random.Random(seed)
+        # Stage 0: the wall line is laid out, but nothing is standing on it yet.
+        self.profile = WallProfile(self.r_center, theta_center_deg,
+                                   ridge_half_length, 0.0, slope,
+                                   planner.ground_z if base_z is None else base_z)
+        self.stage = 0
+        self.rock_count = 0
+        self.course_z = []     # centre height of every course laid so far
+
+    @property
+    def slope(self):
+        return self.profile.slope
+
+    # ---- growth ----
+    def grow(self, half_width=None, height=None, add_half_width=None,
+             add_height=None):
+        """Enlarge the wall and return `(profile, courses)` for the rocks to add.
+
+        Give the new size as a base `half_width` or a crest `height`, or as an
+        increment on the current one (`add_half_width` / `add_height`); with no
+        argument the crest rises by `growth_rise`. Whichever you give, the slope
+        fixes the rest of the profile -- that is the constant this class keeps.
+
+        `courses` is a list of courses (lowest first), each a list of
+        `(position, rotation)` pairs: world `ChVector3d` / `ChQuaterniond` ready
+        to spawn rock bodies at, and *only* the rocks this call adds. Courses the
+        call does not touch are left out, so the list is not a full section of the
+        wall -- `profile` is the description of the whole thing.
+        """
+        target = self._target_half_width(half_width, height, add_half_width,
+                                         add_height)
+        if target <= self.profile.half_width + 1e-9:
+            raise ValueError(
+                f"the wall is already {self.profile.half_width:.3f} m half-width "
+                f"({self.profile.height:.3f} m high); grow() only builds up, and "
+                f"{target:.3f} m is not bigger")
+        old, new = self.profile, self.profile.grown(half_width=target)
+
+        courses = []
+        for z in self._course_heights(new):
+            poses = self._sample_course(z, new, old)
+            if poses:
+                courses.append(poses)
+                if z not in self.course_z:
+                    self.course_z.append(z)
+        self.profile = new
+        self.stage += 1
+        self.rock_count += sum(len(c) for c in courses)
+        return new, courses
+
+    def _target_half_width(self, half_width, height, add_half_width, add_height):
+        """Resolve the four mutually exclusive size arguments to a half-width."""
+        given = [x for x in (half_width, height, add_half_width, add_height)
+                 if x is not None]
+        if len(given) > 1:
+            raise ValueError("grow() takes at most one of half_width, height, "
+                             "add_half_width, add_height")
+        if half_width is not None:
+            return half_width
+        if height is not None:
+            return height / self.slope
+        if add_half_width is not None:
+            return self.profile.half_width + add_half_width
+        rise = self.growth_rise if add_height is None else add_height
+        return self.profile.half_width + rise / self.slope
+
+    def _course_heights(self, profile):
+        """Centre heights of every course the profile holds, lowest first.
+
+        The first sits half a rise above the base, so a course of rocks is bedded
+        on the ground rather than half-buried in it, and they step up by `rise`
+        until the next one would poke out of the crest.
+        """
+        n = int(math.floor(profile.height / self.rise + 1e-9))
+        return [profile.base_z + (k + 0.5) * self.rise for k in range(n)]
+
+    def _sample_course(self, z, new, old):
+        """Poses for the rocks course `z` gains going from profile `old` to `new`.
+
+        The course's footprint is a rectangle in (radial offset, arc offset) and
+        the old wall's is a smaller rectangle inside it, so the rocks to add are
+        the frame between them -- sampled by rejection, which is cheap because
+        the frame is never a thin sliver of the outer rectangle at the heights
+        that hold most of the rock.
+        """
+        half_width, half_length = new.footprint_at(z)
+        if half_width <= 0.0:
+            return []
+        old_half_width, old_half_length = old.footprint_at(z)
+        area = 4.0 * (half_width * half_length
+                      - old_half_width * old_half_length)
+        count = int(round(self.density * area))
+        if count <= 0:
+            return []
+
+        poses = []
+        for _ in range(count):
+            pos = None
+            for _ in range(self.max_attempts):
+                u = self._rng.uniform(-half_width, half_width)
+                s = self._rng.uniform(-half_length, half_length)
+                if abs(u) < old_half_width and abs(s) < old_half_length:
+                    continue          # inside what is already standing
+                candidate = self._to_world(u, s, z)
+                if pos is None:
+                    pos = candidate   # usable; keep looking for a roomier spot
+                if all((candidate - p).Length() > self.min_sep for p, _ in poses):
+                    pos = candidate
+                    break
+            if pos is None:
+                break                 # this course is full of the old wall
+            poses.append((pos, self._random_rotation()))
+        return poses
+
+    def _to_world(self, u, s, z):
+        """World point at radial offset `u`, arc offset `s` (m), height `z`."""
+        return self.planner.to_world(
+            self.r_center + u,
+            self.theta_center_deg + math.degrees(s / self.r_center), z)
+
+    def _random_rotation(self):
+        """A random yaw, then a small tilt about a random horizontal axis."""
+        yaw = chrono.QuatFromAngleZ(self._rng.uniform(-math.pi, math.pi))
+        axis_angle = self._rng.uniform(0.0, 2.0 * math.pi)
+        axis = chrono.ChVector3d(math.cos(axis_angle), math.sin(axis_angle), 0.0)
+        tilt = chrono.QuatFromAngleAxis(
+            math.radians(self._rng.uniform(0.0, self.tilt_deg)), axis)
+        return tilt * yaw
+
+    # ---- reporting ----
+    def plan(self, half_width=None, height=None, add_half_width=None,
+             add_height=None):
+        """The course table `grow()` would produce, without producing it.
+
+        Returns `(profile, rows)` where each row is
+        `(z, half_width, half_length, rocks)` for one course of the enlarged
+        wall -- including the courses that gain nothing, so it reads as a section
+        of the whole wall. Rock counts are the same integers `grow` uses.
+        """
+        target = self._target_half_width(half_width, height, add_half_width,
+                                         add_height)
+        old, new = self.profile, self.profile.grown(half_width=target)
+        rows = []
+        for z in self._course_heights(new):
+            half_w, half_l = new.footprint_at(z)
+            old_w, old_l = old.footprint_at(z)
+            count = int(round(self.density * 4.0
+                              * (half_w * half_l - old_w * old_l)))
+            rows.append((z, half_w, half_l, max(count, 0)))
+        return new, rows
+
+    def describe(self):
+        """Multi-line summary of what is standing after the calls made so far."""
+        return "\n".join([
+            f"sloped wall: stage {self.stage}, {self.rock_count} stand-in rocks "
+            f"in {len(self.course_z)} course(s) {self.rise:.2f} m apart",
+            self.profile.describe(),
+        ])
+
+
 def plan_layers_from_state(rock_state_csv, num_layers, site_plan_csv=None,
                            planner=None, only_placed=True, skip_fake=True,
                            rocks_per_layer=None, rise=None, base_z=None, seed=None):
@@ -511,8 +892,9 @@ def plan_layers_from_state(rock_state_csv, num_layers, site_plan_csv=None,
 
     if planner is None:
         planner = OrbitPlanner.from_site_plan(plan) if plan else OrbitPlanner()
-    # The run's own course rise is the rock height that produced this belt.
-    rock_height = plan.get("course_rise", LAYER_RISE)
+    # The run's own rock height is what produced this belt. Older plans recorded
+    # it as the rise between courses of real rocks, which was the same number.
+    rock_height = plan.get("rock_height", plan.get("course_rise", LAYER_RISE))
 
     rocks = read_rock_state(rock_state_csv)
     belt = planner.measure_belt(rocks, only_placed=only_placed,
@@ -545,3 +927,14 @@ if __name__ == "__main__":
         planner = OrbitPlanner()
         station = planner.builder_stations(1)[0]  # builder 1: the +Y side of the site
         print(planner.describe(station))
+        # ...and the wall those points are on the line of, grown in three dumps.
+        # Nothing is measured here: the wall is prescribed, so this needs no run.
+        stacker = SlopedWallStacker(planner, station,
+                                    ridge_span_deg=2 * planner.half_span_deg, seed=0)
+        print()
+        for height in (0.6, 0.9, 1.2):
+            profile, courses = stacker.grow(height=height)
+            print(f"  dump {stacker.stage}: +{sum(len(c) for c in courses)} rocks -> "
+                  f"base {2 * profile.half_width:.2f} m, crest {profile.height:.2f} m, "
+                  f"H/R={profile.height / profile.half_width:.2f}")
+        print(stacker.describe())

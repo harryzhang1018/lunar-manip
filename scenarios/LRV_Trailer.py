@@ -328,6 +328,22 @@ class TrailerArm(LRV_Arm):
         self._advance_grasp()
         return self._grasp_done
 
+    def replan_grasp(self):
+        """Restart the sequence in progress against the rock's *current* position.
+
+        `_begin_grasp` solves the IK once, from where the rock was when the
+        sequence started, and the close-and-retry path does not re-solve it: it
+        reopens the fingers and closes them again on the same spot. So a rock the
+        approach nudged out from under the pads is unreachable for the rest of the
+        sequence, and the retry repeats forever. Call this when a cycle has stopped
+        making progress and the arm should aim at where the rock is now.
+
+        Only sensible while nothing is held -- it opens the fingers, so calling it
+        mid-carry drops the rock.
+        """
+        if self._grasp_target is not None:
+            self._begin_grasp(self._grasp_target)
+
     # ---- internals ----
     def _begin_grasp(self, rock):
         """Plan the grasp for `rock` and reset the staged sequence to its start."""
