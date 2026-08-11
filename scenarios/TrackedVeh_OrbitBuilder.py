@@ -91,7 +91,9 @@ DEFAULT_STATE_DIR, or `--no-state` to skip writing them. Add `--no-wall` to drop
 the dumps from the build plan and run the pick-and-place phases on their own. Add
 `--run-time N` to stop somewhere other than DEFAULT_RUN_TIME (0 = never, i.e. run
 until the window is closed). Add `--continue [CSV]` for mode 2, reading the state
-of the finished section from CSV (default: DEFAULT_STATE_DIR/rock_state.csv).
+of the finished section from CSV (default: DEFAULT_STATE_DIR/rock_state.csv). Add
+`--export-blender` to export a Chrono::Postprocess Blender scene (30 frames/s of
+sim time) to the Chrono output dir's BLENDER subfolder, independent of rendering.
 
 `wall_stack_demo.py` is this scenario's wall on its own -- no vehicle, no gripper,
 no real rocks -- which is the quick way to look at the wall geometry or tune it.
@@ -118,10 +120,12 @@ import csv
 import math
 import zlib
 import random
+import shutil
 import datetime
 
 import pychrono as chrono
 import pychrono.vehicle as veh
+import pychrono.postprocess as postprocess
 
 # Make the repo root (for the `model` package) and the scenarios dir (for the
 # sibling scenario modules reused below) importable regardless of the CWD.
@@ -1653,7 +1657,8 @@ def write_site_plan(path, vehicle, sim_time, stamp, placed, section=1):
 
 def run(m113, vehicle, terrain, gripper, rocks, targets=(), vis=None,
         run_time=DEFAULT_RUN_TIME, frame_output_dir=None,
-        plan=BUILD_PLAN, frame_stride=1, occupied_to_deg=None, section=1):
+        plan=BUILD_PLAN, frame_stride=1, occupied_to_deg=None, section=1,
+        exporter=None):
     """Hold the brakes; after the scene settles, work through `plan`.
 
     Once the rig has settled, `gripper.grasp(rock, targets[i])` is called every
@@ -1689,6 +1694,10 @@ def run(m113, vehicle, terrain, gripper, rocks, targets=(), vis=None,
     is tens of thousands of images otherwise, and a movie of it wants to run faster
     than real time anyway.
 
+    With `exporter` (a `postprocess.ChBlender` set up by the caller), a scene
+    frame is written at 30 fps of sim time, independent of whether a render
+    window is open.
+
     Returns `(placed, fake, targets, rocks)`: a per-rock flag for the ones the
     gripper actually laid (see GRASP_SKIP_AFTER for the ones it can give up on),
     the stand-in rock bodies of every dump grouped per course, the full target list
@@ -1716,6 +1725,8 @@ def run(m113, vehicle, terrain, gripper, rocks, targets=(), vis=None,
     placed = [False] * len(rocks)
     frame_idx = 0   # PNGs written
     rendered = 0    # frames drawn (frame_stride of these get written)
+    next_export_time = 0.0
+    export_interval = 1.0 / 30  # seconds between exported Blender frames
     fake = []  # stand-in rocks, one list per course, over every dump
     held, released_at = False, None  # settle watch for the rock being laid on top
     attempt_t0 = None    # sim time the current rock's pick-and-place cycle began
@@ -1833,6 +1844,10 @@ def run(m113, vehicle, terrain, gripper, rocks, targets=(), vis=None,
                 rendered += 1
                 vis.EndScene()
 
+            if exporter is not None and time >= next_export_time:
+                exporter.ExportData()
+                next_export_time += export_interval
+
             # ---- relocating to the next section, or parked and building ----
             # `step` hands back path-follower inputs until the builder has reached
             # its target, braked and settled; then None, and the arrival work runs
@@ -1928,6 +1943,7 @@ def main():
     use_vsg = "--vsg" in sys.argv  # render with VSG (Vulkan) instead of Irrlicht
     plan_only = "--plan-only" in sys.argv
     frame_output_dir = parse_frame_output_dir(sys.argv)
+    export_blender = "--export-blender" in sys.argv
     state_dir = parse_state_dir(sys.argv)
     # `--no-wall` drops the dumps and leaves the pick-and-place phases, which is
     # the quick way to check the arm's half of the plan on its own.
@@ -2047,6 +2063,19 @@ def main():
         print(f"  run time      : {run_time:.0f} s of sim")
     print(f"  state CSVs    : {state_dir or 'disabled (--no-state)'}")
 
+    exporter = None
+    if export_blender:
+        out_dir = chrono.GetChronoOutputPath() + "BLENDER"
+        if os.path.exists(out_dir):
+            shutil.rmtree(out_dir)
+        os.makedirs(out_dir)
+        exporter = postprocess.ChBlender(m113.GetSystem())
+        exporter.SetBasePath(out_dir)
+        exporter.SetBlenderUp_is_ChronoZ()
+        exporter.AddAll()
+        exporter.ExportScript()
+        print(f"  blender export: {out_dir} (30 frames/s of sim time)")
+
     vis = None if headless else make_vis(vehicle, title, use_vsg=use_vsg)
     placed, fake, targets = [False] * len(rocks), [], []
     try:
@@ -2055,7 +2084,7 @@ def main():
                                            frame_output_dir=frame_output_dir,
                                            plan=plan, frame_stride=frame_stride,
                                            occupied_to_deg=occupied_to_deg,
-                                           section=section)
+                                           section=section, exporter=exporter)
     finally:
         # Dump the end state even if the run was cut short, so a partial build is
         # still resumable (and still tells you where every rock ended up).
