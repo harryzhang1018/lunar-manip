@@ -337,6 +337,20 @@ def rock_shape_for(name, section=1):
     return rock_shape(rock_variant(name, section))
 
 
+def strip_visual_materials(body):
+    """Clear the textures/colors on `body`'s visual shapes in place.
+
+    Every rock variant's visual shape is a single object shared across all
+    rocks drawing that variant (see `place_rock`), so clearing it here via one
+    rock also clears it for every other rock sharing that shape.
+    """
+    vis = body.GetVisualModel()
+    if vis is None:
+        return
+    for i in range(vis.GetNumShapes()):
+        vis.GetShape(i).GetMaterials().clear()
+
+
 # End-effector grasp height: how high above the ground (z) the gripper center aims
 # when reaching for a rock. The rocks are a fixed ~0.2 m tall AND the gripper
 # fingers are NOT scaled with the arm (they stay 1x so they can grasp the small
@@ -808,6 +822,7 @@ def spawn_scenery_rocks(system, rows, vis=None):
         body.SetFixed(True)
         body.EnableCollision(False)
         body.AddVisualShape(shape.visual)
+        strip_visual_materials(body)
         system.Add(body)
         if vis is not None:
             vis.BindItem(body)
@@ -993,6 +1008,7 @@ def spawn_wall_rocks(system, courses, stage=1, collides=FAKE_WALL_COLLIDES,
                               contact_method=chrono.ChContactMethod_SMC,
                               shape=rock_shape_for(name, section))
             rock.SetName(name)
+            strip_visual_materials(rock)
             # Turn the rock about its own centre of mass: the reference frame sits
             # off to one side of the mesh, so rotating that frame in place would
             # carry the rock with it, off the sampled point. The same step lifts
@@ -1213,6 +1229,7 @@ def spawn_wedge_rocks(system, gripper, terrain, arm_pos, chassis_rot,
                           contact_method=chrono.ChContactMethod_SMC,
                           shape=rock_shape_for(name, section))
         rock.SetName(name)
+        strip_visual_materials(rock)
         if ROCK_PHASE[i] == "ground":
             # Tag the rocks destined for the ground layer, so the stand-in wall
             # that later gets dumped over them can be told to ignore them (see
@@ -1282,6 +1299,24 @@ def build_scene(spawn_rocks=True, scenery_rows=(), section=1):
     m113.SetRoadWheelVisualizationType(track_vis)
     m113.SetTrackShoeVisualizationType(track_vis)
 
+    # Swap in a custom chassis mesh in place of the stock M113 Chassis.obj.
+    chassis_body = m113.GetVehicle().GetChassisBody()
+    chassis_body.GetVisualModel().Clear()
+    custom_chassis_mesh = chrono.ChTriangleMeshConnected()
+    custom_chassis_mesh.LoadWavefrontMesh(
+        os.path.expanduser("~/Downloads/Chassis.obj"), True, True)
+    custom_chassis_shape = chrono.ChVisualShapeTriangleMesh()
+    custom_chassis_shape.SetMesh(custom_chassis_mesh)
+    chassis_body.AddVisualShape(custom_chassis_shape, chrono.ChFramed())
+
+    # Strip the mesh textures/colors baked into the M113's OBJ/MTL files, while
+    # keeping the real tread/hull geometry (VisualizationType_MESH above) rather
+    # than falling back to primitive shapes. Only the vehicle's own bodies exist
+    # in the system at this point -- terrain, arm and markers are added later --
+    # so this can't touch anything else's visuals.
+    for body in m113.GetSystem().GetBodies():
+        strip_visual_materials(body)
+
     system = m113.GetSystem()
     system.SetCollisionSystemType(chrono.ChCollisionSystem.Type_BULLET)
     solver = chrono.ChSolverBB()
@@ -1306,6 +1341,14 @@ def build_scene(spawn_rocks=True, scenery_rows=(), section=1):
     arm_pos = vehicle.GetChassis().GetPos() + chassis_rot.Rotate(ARM_OFFSET)
     gripper = TrailerArm(system, arm_pos, vehicle, scale=ARM_SCALE,
                          mount_rot=ARM_MOUNT_ROT)
+
+    # Same texture/color strip as the M113 above, applied to the arm's own
+    # bodies now that they exist -- the earlier pass ran before the gripper
+    # was built, so it couldn't reach these.
+    for body in (gripper.base, gripper.shoulder, gripper.biceps, gripper.elbow,
+                gripper.wrist, gripper.endoffactor, gripper.finger_1, gripper.finger_2):
+        strip_visual_materials(body)
+
     match_gripper_contact_material(gripper, chrono.ChContactMethod_SMC, ARM_SCALE)
     gripper.GRAB_HEIGHT = GRAB_HEIGHT
     gripper.PLACE_SPEED_TOL = PLACE_SPEED_TOL    # set the rock down, don't throw it
@@ -1320,17 +1363,14 @@ def build_scene(spawn_rocks=True, scenery_rows=(), section=1):
     minfo.cr = 0.2
     minfo.Y = 2e7
     patch_mat = minfo.CreateMaterial(chrono.ChContactMethod_SMC)
+    # `visualization=False`: SetColor/SetTexture only style the patch's visual
+    # box shape, which AddPatch builds regardless of them (Patch::m_visualize
+    # defaults True) -- this is the actual switch that skips building it.
     patch = terrain.AddPatch(
         patch_mat,
         chrono.ChCoordsysd(chrono.ChVector3d(ORBIT_CENTER[0], ORBIT_CENTER[1], 0),
                            chrono.QUNIT),
-        TERRAIN_SIZE, TERRAIN_SIZE)
-    # A repeating texture rather than TrackedVeh_Builder's flat color: this patch
-    # is 100 m across and lit from above, and a flat light gray at that size just
-    # blows out to white, hiding the orbit markers drawn on it.
-    patch.SetColor(chrono.ChColor(0.45, 0.45, 0.45))
-    patch.SetTexture(veh.GetVehicleDataFile("terrain/textures/dirt.jpg"),
-                     TERRAIN_SIZE / 4.0, TERRAIN_SIZE / 4.0)
+        TERRAIN_SIZE, TERRAIN_SIZE, 1, False, 1, False)
     terrain.Initialize()
 
     # ---- Rocks on the ground in the spawn wedge alongside the builder ----

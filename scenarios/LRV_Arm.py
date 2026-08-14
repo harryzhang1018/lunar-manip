@@ -33,9 +33,11 @@ import math
 import random
 import io
 import contextlib
+import shutil
 
 import pychrono as chrono
 import pychrono.vehicle as veh
+import pychrono.postprocess as postprocess
 
 # Make the repo root importable so the `model` package resolves regardless of
 # the current working directory.
@@ -415,7 +417,6 @@ def build_scene(rock_pos=None):
     patch = terrain.AddPatch(patch_mat,
                              chrono.ChCoordsysd(chrono.ChVector3d(INIT_LOC.x, INIT_LOC.y, 0), chrono.QUNIT),
                              100.0, 100.0)
-    patch.SetColor(chrono.ChColor(0.7, 0.7, 0.7))
     terrain.Initialize()
 
     # Optional rock, placed as part of the scene (e.g. at the recorded EE),
@@ -477,7 +478,7 @@ def make_vis(vehicle, title):
 
 
 def drive_arm(system, vehicle, terrain, gripper, theta, vis=None, settle_time=4.0,
-              grab=False):
+              grab=False, blender_exporter=None):
     """Brake the vehicle and drive the arm to `theta` (staggered to avoid a snap).
 
     With `grab=True`, once the pose has settled the gripper finishes the last
@@ -486,7 +487,8 @@ def drive_arm(system, vehicle, terrain, gripper, theta, vis=None, settle_time=4.
     shoulder joint (theta 2) to LIFT_THETA2 (t > T_LIFT).
 
     With `vis`, render until the window is closed; otherwise step headless until
-    `settle_time` seconds. Returns the final gripper-center position.
+    `settle_time` seconds. With `blender_exporter`, export a frame at `fps`
+    while 0.05 s <= t < 20 s. Returns the final gripper-center position.
     """
     driver_inputs = veh.DriverInputs()
     driver_inputs.m_throttle = 0.0
@@ -499,6 +501,9 @@ def drive_arm(system, vehicle, terrain, gripper, theta, vis=None, settle_time=4.
     lift_angle = None  # current shoulder target while lifting
     next_tick = 0.0    # next control-tick time for the staged grab/lift
     steps = 0
+    fps = 60
+    frame_interval = 1.0 / fps  # seconds between exported Blender frames
+    next_export_time = 0.0
     if vis is not None:
         vehicle.EnableRealtime(True)
 
@@ -514,6 +519,11 @@ def drive_arm(system, vehicle, terrain, gripper, theta, vis=None, settle_time=4.
             vis.BeginScene()
             vis.Render()
             vis.EndScene()
+
+        if blender_exporter is not None and 0.05 <= time < 20:
+            if time >= next_export_time:
+                blender_exporter.ExportData()
+                next_export_time += frame_interval
 
         # ---- drive the arm to the target pose (staggered) ----
         if time > 1.0 and not moved_arm:
@@ -604,7 +614,19 @@ def main():
     system2, vehicle2, terrain2, gripper2 = build_scene(rock_pos=ee_pos)
     gripper2.add_object("rock")  # register the rock with the gripper's lock logic
     vis = make_vis(vehicle2, "LRV Gripper -- replay, grab, and lift")
-    drive_arm(system2, vehicle2, terrain2, gripper2, final_theta, vis=vis, grab=True)
+
+    out_dir = chrono.GetChronoOutputPath() + "BLENDER"
+    if os.path.exists(out_dir):
+        shutil.rmtree(out_dir)
+    os.makedirs(out_dir)
+    blender_exporter = postprocess.ChBlender(system2)
+    blender_exporter.SetBasePath(out_dir)
+    blender_exporter.SetBlenderUp_is_ChronoZ()
+    blender_exporter.AddAll()
+    blender_exporter.ExportScript()
+
+    drive_arm(system2, vehicle2, terrain2, gripper2, final_theta, vis=vis, grab=True,
+              blender_exporter=blender_exporter)
 
 
 if __name__ == "__main__":
