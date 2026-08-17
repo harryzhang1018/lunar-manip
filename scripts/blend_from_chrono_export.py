@@ -31,10 +31,13 @@ terrain/camera/lighting/world shader from an earlier hand-assembled file:
     #   DEMO_OUTPUT/BLENDER ~/Documents/BlenderDocuments/blenderfiles/blendFiles/orbit_builder.blend 30 \\
     #   ~/Documents/BlenderDocuments/blenderfiles/blendFiles/builder5.blend "Collection.001" \\
     #   ~/Documents/BlenderDocuments/blenderfiles/blendFiles/builder5.blend "Collection 6" \\
-    #   --world ~/Documents/BlenderDocuments/blenderfiles/blendFiles/builder5.blend "World"
+    #   --world ~/Documents/BlenderDocuments/blenderfiles/blendFiles/builder5.blend "World" \\
+    #   --texture ~/Downloads/rock rock \\
+    #   --robot-texture ~/Poliigon/Library/MetalGalvanizedSteelWorn001 "M113_TrackShoeLeft_shoe,M113_TrackShoeRight_shoe"
 """
 
 import glob
+import math
 import os
 import re
 import sys
@@ -54,22 +57,32 @@ def parse_args():
             "usage: blender --background --python blend_from_chrono_export.py "
             "-- <export_dir> <output.blend> [fps] "
             "[<append_blend> <collection_name>]... "
-            "[--world <append_blend> <world_name>]")
+            "[--world <append_blend> <world_name>] "
+            "[--texture <folder> <family_name>[,<family_name>...]]... "
+            "[--robot-texture <folder> <comma_separated_exclude_families_or_''>]")
     export_dir = argv[0]
     out_path = argv[1]
     fps = int(argv[2]) if len(argv) > 2 else 30
     rest = argv[3:]
     appends = []
     world_append = None
+    textures = []
+    robot_texture = None
     i = 0
     while i < len(rest):
         if rest[i] == "--world":
             world_append = (rest[i + 1], rest[i + 2])
             i += 3
+        elif rest[i] == "--texture":
+            textures.append((rest[i + 1], rest[i + 2]))
+            i += 3
+        elif rest[i] == "--robot-texture":
+            robot_texture = (rest[i + 1], rest[i + 2])
+            i += 3
         else:
             appends.append((rest[i], rest[i + 1]))
             i += 2
-    return export_dir, out_path, fps, appends, world_append
+    return export_dir, out_path, fps, appends, world_append, textures, robot_texture
 
 
 def frame_index(path):
@@ -138,6 +151,198 @@ def append_world(filepath, world_name):
         if world is not None:
             bpy.context.scene.world = world
             print(f"  appended world '{world.name}' from {filepath} and set as scene world")
+
+
+# Token keywords (matched against a filename's '_'/'-'-delimited stem, after
+# stripping trailing resolution/workflow tags -- see `_core_tokens` below)
+# identifying each PBR map across Poliigon's various naming conventions, e.g.
+# 'Rock020_4K-JPG_Color.jpg' and 'MetalGalvanizedSteelWorn001_COL_2K_METALNESS.jpg'.
+_TEXTURE_MAP_KEYWORDS = {
+    "color": ("color", "albedo", "basecolor", "diffuse", "col"),
+    "roughness": ("roughness", "rough"),
+    "metalness": ("metalness", "metallic", "metal"),
+    "normal": ("normalgl", "normal_gl", "normal", "nrm"),
+    "ao": ("ambientocclusion", "ao"),
+    "displacement": ("displacement", "height", "disp"),
+}
+
+# Trailing tokens that are resolution/workflow tags, not the map type -- e.g.
+# every file in a Poliigon "Metalness workflow" set ends in '_METALNESS'
+# regardless of which map it actually is, and '_2K' is just the resolution.
+_TEXTURE_NON_MAP_SUFFIXES = {"metalness", "specular", "metallic", "gloss"}
+
+
+def _core_tokens(filename):
+    """`filename`'s stem split into lowercase tokens, with a trailing
+    workflow-tag token (e.g. 'metalness') and then a trailing resolution
+    token (e.g. '2k') stripped -- each at most once, and in that order, since
+    the real map-type token can itself equal a workflow-tag word (the
+    metalness map in a "Metalness workflow" set is literally named
+    '..._METALNESS_2K_METALNESS.ext'; only the very last one is the tag)."""
+    stem = os.path.splitext(filename)[0]
+    tokens = [t.lower() for t in re.split(r"[_\-]+", stem) if t]
+    if tokens and tokens[-1] in _TEXTURE_NON_MAP_SUFFIXES:
+        tokens = tokens[:-1]
+    if tokens and re.fullmatch(r"\d+k", tokens[-1]):
+        tokens = tokens[:-1]
+    return tokens
+
+
+def build_pbr_material_from_folder(name, folder):
+    """Build a Principled BSDF material by auto-detecting and wiring up the
+    image maps in `folder`, matching what Node Wrangler's 'Add Principled
+    Texture Setup' does in the UI. That operator is bound to an active Shader
+    Editor context (a selected Principled node in an open node-editor area),
+    which isn't reliably driveable from a --background run with no UI, so
+    this reproduces its node graph directly instead."""
+    folder = os.path.abspath(os.path.expanduser(folder))
+    files = os.listdir(folder)
+    file_tokens = {fname: _core_tokens(fname) for fname in files}
+
+    def find(map_key):
+        for keyword in _TEXTURE_MAP_KEYWORDS[map_key]:
+            for fname, tokens in file_tokens.items():
+                if keyword in tokens:
+                    return os.path.join(folder, fname)
+        return None
+
+    paths = {key: find(key) for key in _TEXTURE_MAP_KEYWORDS}
+    found = {k: v for k, v in paths.items() if v}
+    print(f"  texture '{name}' from {folder}: {list(found)}")
+
+    mat = bpy.data.materials.new(name)
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
+
+    output = nodes.new("ShaderNodeOutputMaterial")
+    output.location = (400, 0)
+    bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+    bsdf.location = (0, 0)
+    links.new(bsdf.outputs["BSDF"], output.inputs["Surface"])
+
+    def add_image_node(path, non_color, y):
+        img = bpy.data.images.load(path)
+        img.colorspace_settings.name = 'Non-Color' if non_color else 'sRGB'
+        node = nodes.new("ShaderNodeTexImage")
+        node.image = img
+        node.location = (-600, y)
+        return node
+
+    y = 400
+    if paths["color"]:
+        color_node = add_image_node(paths["color"], non_color=False, y=y)
+        if paths["ao"]:
+            ao_node = add_image_node(paths["ao"], non_color=True, y=y - 300)
+            mix = nodes.new("ShaderNodeMixRGB")
+            mix.blend_type = 'MULTIPLY'
+            mix.inputs["Fac"].default_value = 1.0
+            mix.location = (-300, y)
+            links.new(color_node.outputs["Color"], mix.inputs["Color1"])
+            links.new(ao_node.outputs["Color"], mix.inputs["Color2"])
+            links.new(mix.outputs["Color"], bsdf.inputs["Base Color"])
+        else:
+            links.new(color_node.outputs["Color"], bsdf.inputs["Base Color"])
+        y -= 300
+    if paths["roughness"]:
+        rough_node = add_image_node(paths["roughness"], non_color=True, y=y)
+        links.new(rough_node.outputs["Color"], bsdf.inputs["Roughness"])
+        y -= 300
+    if paths["metalness"]:
+        metal_node = add_image_node(paths["metalness"], non_color=True, y=y)
+        links.new(metal_node.outputs["Color"], bsdf.inputs["Metallic"])
+        y -= 300
+    if paths["normal"]:
+        normal_img_node = add_image_node(paths["normal"], non_color=True, y=y)
+        normal_map_node = nodes.new("ShaderNodeNormalMap")
+        normal_map_node.location = (-300, y)
+        links.new(normal_img_node.outputs["Color"], normal_map_node.inputs["Color"])
+        links.new(normal_map_node.outputs["Normal"], bsdf.inputs["Normal"])
+        y -= 300
+    if paths["displacement"]:
+        disp_img_node = add_image_node(paths["displacement"], non_color=True, y=y)
+        disp_node = nodes.new("ShaderNodeDisplacement")
+        disp_node.location = (100, -400)
+        links.new(disp_img_node.outputs["Color"], disp_node.inputs["Height"])
+        links.new(disp_node.outputs["Displacement"], output.inputs["Displacement"])
+
+    return mat
+
+
+# Name prefixes identifying the M113 vehicle and the gripper arm (see
+# make_bsdf_material call sites in a state file dump, and the SearchBody
+# names in model/arm_model.py) -- used to scope UV unwrapping to "the robot"
+# without touching orbit_markers, place discs, or terrain.
+_ROBOT_NAME_PREFIXES = (
+    "M113", "Chassis", "base-", "shoulder-", "bicep", "elbow-", "wrist-",
+    "endeffector-", "finger-",
+)
+
+
+def is_robot(name):
+    return any(name.startswith(p) for p in _ROBOT_NAME_PREFIXES)
+
+
+def is_robot_or_rock(name):
+    return name.startswith("rock") or is_robot(name)
+
+
+def all_objects_in_collection(collection):
+    """Every object under `collection`, including ones sitting in nested
+    sub-collections (e.g. the per-family collections `group_into_family_collections`
+    builds) -- `collection.objects` alone only sees the loose top-level ones."""
+    objs = list(collection.objects)
+    for child in collection.children:
+        objs.extend(all_objects_in_collection(child))
+    return objs
+
+
+def get_family_objects(instances_collection, family_name):
+    """Objects in the named family sub-collection built by
+    `group_into_family_collections`, or the single loose object of that name
+    if it was never grouped (no other object shared its stripped name)."""
+    sub = instances_collection.children.get(family_name)
+    if sub:
+        return list(sub.objects)
+    return [o for o in instances_collection.objects if o.name == family_name]
+
+
+def apply_material_to_family(instances_collection, family_name, material):
+    """Assign `material` (replacing whatever's there) to every object in the
+    named family."""
+    objs = get_family_objects(instances_collection, family_name)
+    if not objs:
+        print(f"  warning: no objects found for family '{family_name}'")
+        return
+    for obj in objs:
+        obj.data.materials.clear()
+        obj.data.materials.append(material)
+    print(f"  applied material '{material.name}' to {len(objs)} object(s) in '{family_name}'")
+
+
+def smart_uv_unwrap(objects, angle_limit_degrees=66.0):
+    """Smart UV Project every unique mesh among `objects`, once per mesh
+    datablock even if several objects share it (Chrono's exported rock meshes
+    have no usable UVs of their own, so an image texture applied without this
+    would map garbage). Unlike Node Wrangler's texture-setup operator, this
+    one only needs an active object in Edit Mode, not a live Shader Editor
+    area, so it runs fine in a --background session."""
+    view_layer = bpy.context.view_layer
+    seen = set()
+    for obj in objects:
+        if obj.type != 'MESH' or obj.data.name in seen:
+            continue
+        seen.add(obj.data.name)
+        for o in view_layer.objects:
+            o.select_set(False)
+        obj.select_set(True)
+        view_layer.objects.active = obj
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='SELECT')
+        bpy.ops.uv.smart_project(angle_limit=math.radians(angle_limit_degrees))
+        bpy.ops.object.mode_set(mode='OBJECT')
+    print(f"  smart-UV-unwrapped {len(seen)} unique mesh(es) across {len(objects)} object(s)")
 
 
 def get_or_create_collection(name, hide_render=False):
@@ -324,7 +529,7 @@ class SceneBuilder:
 
 
 def main():
-    export_dir, out_path, fps, appends, world_append = parse_args()
+    export_dir, out_path, fps, appends, world_append, textures, robot_texture = parse_args()
 
     assets_files = glob.glob(os.path.join(export_dir, "*.assets.py"))
     if not assets_files:
@@ -338,6 +543,9 @@ def main():
 
     bpy.ops.wm.read_factory_settings(use_empty=True)
     bpy.context.scene.render.fps = fps
+    bpy.context.scene.render.engine = 'BLENDER_EEVEE'
+    bpy.context.scene.eevee.use_raytracing = True
+    bpy.context.scene.eevee.shadow_step_count = 10
 
     assets_collection = get_or_create_collection("chrono_assets", hide_render=True)
     instances_collection = get_or_create_collection("chrono_instances")
@@ -371,6 +579,28 @@ def main():
             print(f"  frame {builder.frame} ({n + 1}/{len(state_files)}) ...")
 
     group_into_family_collections(instances_collection)
+
+    unwrap_targets = [o for o in all_objects_in_collection(instances_collection)
+                     if is_robot_or_rock(o.name)]
+    smart_uv_unwrap(unwrap_targets)
+
+    for folder, family_names_csv in textures:
+        family_names = [f.strip() for f in family_names_csv.split(",") if f.strip()]
+        material = build_pbr_material_from_folder(f"{'_'.join(family_names)}_pbr", folder)
+        for family_name in family_names:
+            apply_material_to_family(instances_collection, family_name, material)
+
+    if robot_texture is not None:
+        folder, excludes_csv = robot_texture
+        excludes = {e.strip() for e in excludes_csv.split(",") if e.strip()}
+        material = build_pbr_material_from_folder("robot_pbr", folder)
+        targets = [o for o in all_objects_in_collection(instances_collection)
+                  if is_robot(o.name) and family_key(o.name) not in excludes]
+        for obj in targets:
+            obj.data.materials.clear()
+            obj.data.materials.append(material)
+        print(f"  applied material 'robot_pbr' to {len(targets)} robot object(s)"
+             f"{', excluding ' + str(excludes) if excludes else ''}")
 
     for append_path, collection_name in appends:
         append_collection(append_path, collection_name)
