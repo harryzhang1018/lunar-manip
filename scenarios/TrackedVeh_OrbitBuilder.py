@@ -2154,6 +2154,16 @@ def main():
                   f"({len(carried)} carried + "
                   f"{len(rocks) + sum(len(c) for c in fake)} new)")
             print(f"  site plan     : {plan_csv}")
+        if exporter is not None:
+            # Mirror the exported scene where Blender's own import browser looks
+            # by default, so opening it there doesn't mean hunting through the
+            # Chrono output dir first.
+            blender_copy_dir = os.path.expanduser(
+                "~/Documents/BlenderDocuments/ChronoImports/Robot")
+            if os.path.exists(blender_copy_dir):
+                shutil.rmtree(blender_copy_dir)
+            shutil.copytree(out_dir, blender_copy_dir)
+            print(f"  blender copy  : {blender_copy_dir}")
 
 
 if __name__ == "__main__":
