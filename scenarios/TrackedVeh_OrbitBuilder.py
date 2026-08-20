@@ -957,7 +957,7 @@ class OrbitDrive:
 
 def spawn_wall_rocks(system, courses, stage=1, collides=FAKE_WALL_COLLIDES,
                      crest_z=None, solid_depth=WALL_SOLID_DEPTH, vis=None,
-                     section=1):
+                     section=1, exporter=None):
     """Spawn a stand-in rock body at every pose in `courses`; return the bodies.
 
     `courses` is what `SlopedWallStacker.grow` hands back -- poses grouped by
@@ -985,7 +985,11 @@ def spawn_wall_rocks(system, courses, stage=1, collides=FAKE_WALL_COLLIDES,
 
     With a render window already up, pass `vis` so each new body gets bound to it
     -- Irrlicht builds its scene nodes when the visual system binds, so a body
-    added mid-run is invisible until it is bound.
+    added mid-run is invisible until it is bound. Likewise pass `exporter` (a
+    `postprocess.ChBlender` set up by the caller) to register each new rock with
+    it: `AddAll()` only snapshots the bodies that exist when it is called, so a
+    wall dumped after that call is invisible to the Blender export otherwise --
+    `ExportData()` only ever writes state for items the exporter knows about.
     """
     layers = []
     solid_any = False
@@ -1031,6 +1035,8 @@ def spawn_wall_rocks(system, courses, stage=1, collides=FAKE_WALL_COLLIDES,
                 # every item already bound (hull, road wheels, all 100+ track
                 # shoes) as well.
                 vis.BindItem(rock)
+            if exporter is not None:
+                exporter.Add(rock)
             layer.append(rock)
         layers.append(layer)
 
@@ -1048,7 +1054,7 @@ def spawn_wall_rocks(system, courses, stage=1, collides=FAKE_WALL_COLLIDES,
 
 
 def build_wall(system, stacker=None, heights=WALL_STAGE_HEIGHTS,
-               collides=FAKE_WALL_COLLIDES, vis=None, section=1):
+               collides=FAKE_WALL_COLLIDES, vis=None, section=1, exporter=None):
     """Raise the stand-in wall to each crest height in `heights`, in turn.
 
     One `grow()` + spawn per entry, so a wall can come up in dumps: each stage
@@ -1067,7 +1073,7 @@ def build_wall(system, stacker=None, heights=WALL_STAGE_HEIGHTS,
         profile, courses = stacker.grow(height=height)
         spawned = spawn_wall_rocks(system, courses, stage=stacker.stage,
                                    collides=collides, crest_z=profile.crest_z,
-                                   vis=vis, section=section)
+                                   vis=vis, section=section, exporter=exporter)
         layers += spawned
         solid = sum(1 for course in spawned for rock in course
                     if rock.IsCollisionEnabled())
@@ -1194,7 +1200,7 @@ def add_place_markers(system, points, name="place_markers", vis=None):
 
 
 def spawn_wedge_rocks(system, gripper, terrain, arm_pos, chassis_rot,
-                      count=NUM_ROCKS, first=0, vis=None, section=1):
+                      count=NUM_ROCKS, first=0, vis=None, section=1, exporter=None):
     """Drop `count` rocks on the ground in the spawn wedge beside the builder.
 
     Each spot is re-sampled until it clears the tracks, the gripper's IK can reach
@@ -1206,7 +1212,10 @@ def spawn_wedge_rocks(system, gripper, terrain, arm_pos, chassis_rot,
     so mode 2 gets its wedge beside wherever the relocation drive parked rather
     than beside the spawn pose. `first` offsets the rock numbering, and with `vis`
     (a render window already up) each new body is bound as it is made -- both are
-    for that mid-run spawn.
+    for that mid-run spawn. Likewise pass `exporter` for a mid-run spawn (mode 2's
+    fresh load of rock at the new section) so the Blender export -- if one is
+    running -- learns about these rocks too; see `spawn_wall_rocks` for why that
+    doesn't happen automatically.
     """
     rocks, placed_xy = [], []
     for i in range(first, first + count):
@@ -1238,6 +1247,8 @@ def spawn_wedge_rocks(system, gripper, terrain, arm_pos, chassis_rot,
             rock.GetCollisionModel().SetFamily(FAMILY_BUILT_ROCKS)
         if vis is not None:
             vis.BindItem(rock)
+        if exporter is not None:
+            exporter.Add(rock)
         rocks.append(rock)
         placed_xy.append((rock_pos.x, rock_pos.y))
     if system.GetChTime() > 0.0:
@@ -1803,7 +1814,7 @@ def run(m113, vehicle, terrain, gripper, rocks, targets=(), vis=None,
                     # prescribed on the orbit, so this does not shape it either way.
                     print(measure_built_belt(rocks[:GROUND_ROCKS]).describe())
                 _, layers = build_wall(system, stacker, heights=(value,), vis=vis,
-                                       section=section)
+                                       section=section, exporter=exporter)
                 fake.extend(layers)
                 continue
             if stacker.stage == 0:
@@ -1839,7 +1850,7 @@ def run(m113, vehicle, terrain, gripper, rocks, targets=(), vis=None,
         new_rocks = spawn_wedge_rocks(system, gripper, terrain, base,
                                       vehicle.GetChassisBody().GetRot(),
                                       count=NUM_ROCKS, first=len(rocks), vis=vis,
-                                      section=section)
+                                      section=section, exporter=exporter)
         rocks.extend(new_rocks)
         placed.extend([False] * len(new_rocks))
         # Same points `advance_plan` is about to aim at -- clipped clear of the
@@ -2155,11 +2166,13 @@ def main():
                   f"{len(rocks) + sum(len(c) for c in fake)} new)")
             print(f"  site plan     : {plan_csv}")
         if exporter is not None:
-            # Mirror the exported scene where Blender's own import browser looks
-            # by default, so opening it there doesn't mean hunting through the
-            # Chrono output dir first.
+            # Mirror the exported scene into a "latest" folder alongside the
+            # user's own hand-curated builderN archive under the same Robot/
+            # dir, so opening Blender's import browser doesn't mean hunting
+            # through the Chrono output dir first -- named "latest" (not
+            # "Robot" itself) so this can never rmtree the builderN folders.
             blender_copy_dir = os.path.expanduser(
-                "~/Documents/BlenderDocuments/ChronoImports/Robot")
+                "~/Documents/BlenderDocuments/chronoImports/Robot/latest")
             if os.path.exists(blender_copy_dir):
                 shutil.rmtree(blender_copy_dir)
             shutil.copytree(out_dir, blender_copy_dir)
