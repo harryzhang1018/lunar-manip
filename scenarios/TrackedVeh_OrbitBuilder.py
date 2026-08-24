@@ -1181,12 +1181,15 @@ def _add_place_discs(body, points):
             chrono.ChVector3d(point.x, point.y, 0.05), chrono.QUNIT))
 
 
-def add_place_markers(system, points, name="place_markers", vis=None):
+def add_place_markers(system, points, name="place_markers", vis=None, exporter=None):
     """Place-point discs added on their own, mid-run (mode 2, after the drive).
 
     Same markers `add_orbit_visuals` draws, on a separate render-only body, so a
     section whose arc is only known once the builder has parked still shows where
     it is aiming. `vis` binds the new body to a render window that is already up.
+    Likewise pass `exporter` so a Blender export -- if one is running -- learns
+    about this body too; being added mid-run means `AddAll()` never saw it (see
+    `spawn_wall_rocks` for why that doesn't happen automatically).
     """
     markers = chrono.ChBody()
     markers.SetFixed(True)
@@ -1196,6 +1199,8 @@ def add_place_markers(system, points, name="place_markers", vis=None):
     system.Add(markers)
     if vis is not None:
         vis.BindItem(markers)
+    if exporter is not None:
+        exporter.Add(markers)
     return markers
 
 
@@ -1858,7 +1863,7 @@ def run(m113, vehicle, terrain, gripper, rocks, targets=(), vis=None,
         # than where an unobstructed arc would have put them.
         points = ground_targets(station, occupied_to_deg)
         add_place_markers(system, points, name=f"place_markers_{station:.0f}",
-                          vis=vis)
+                          vis=vis, exporter=exporter)
         print(f"  dropped {len(new_rocks)} rocks beside the builder; wall arc "
               f"re-centred on station {station:.2f} deg")
         if occupied_to_deg is not None:

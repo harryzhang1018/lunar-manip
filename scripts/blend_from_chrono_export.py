@@ -91,19 +91,23 @@ full command to render one section scene from chrono.
     python scenarios/TrackedVeh_OrbitBuilder.py --headless --export-blender --continue
     mv DEMO_OUTPUT/BLENDER DEMO_OUTPUT/BLENDER_section2
     blender --background --python scripts/blend_from_chrono_export.py -- \
-          DEMO_OUTPUT/BLENDER_section1\
-          ~/Documents/BlenderDocuments/blenderfiles/blendFiles/combined.blend 30 \
-          ~/Documents/BlenderDocuments/blenderfiles/blendFiles/builder5.blend "Collection.001" \
+          DEMO_OUTPUT/BLENDER_section2\
+          ~/Documents/BlenderDocuments/blenderfiles/blendFiles/section2.blend 30 \
+          ~/Documents/BlenderDocuments/blenderfiles/blendFiles/orbit_builder2.blend "Collection.001" \
           ~/Documents/BlenderDocuments/blenderfiles/blendFiles/orbit_builder2.blend "Collection 6" \
           --world ~/Documents/BlenderDocuments/blenderfiles/blendFiles/builder5.blend "World" \
           --texture ~/Downloads/rock rock \
           --texture ~/Poliigon/Library/Poliigon_PlasticMoldDryBlast_7495/2K "M113_TrackShoeLeft_shoe,M113_TrackShoeRight_shoe" \
           --robot-texture ~/Poliigon/Library/MetalGalvanizedSteelWorn001 "M113_TrackShoeLeft_shoe,M113_TrackShoeRight_shoe"
     cd /home/zacharyrichmond/Documents/BlenderDocuments/blenderfiles/blendFiles
-    blender -b combined.blend -s 12 -e 9140 -o //robot/builder1 -F FFMPEG -a
-    ffmpeg -i ~/Documents/BlenderDocuments/blenderfiles/blendFiles/robot/moon_test_1354060100-2000.mkv \
-  -c copy -movflags +faststart \
-  ~/Documents/BlenderDocuments/blenderfiles/blendFiles/robot/moon_test_1354060100-2000.mp4
+    blender -b section1.blend -s 12 -e 4048 -o //builder/builder1 -F FFMPEG -a
+    blender -b section2.blend -s 5 -e 5090 -o //builder/builder2 -F FFMPEG -a
+    blender -b section1.blend -E CYCLES -s 12 -e 4048 -o //builder/builder1 -F FFMPEG -a
+  printf "file '%s'\nfile '%s'\n" /home/zacharyrichmond/Documents/BlenderDocuments/blenderfiles/blendFiles/builder/builder10012-4048.mkv /home/zacharyrichmond/Documents/BlenderDocuments/blenderfiles/blendFiles/builder/builder20005-5090.mkv > /home/zacharyrichmond/Documents/BlenderDocuments/blenderfiles/blendFiles/builder/concat_list.txt
+
+ffmpeg -f concat -safe 0 -i /home/zacharyrichmond/Documents/BlenderDocuments/blenderfiles/blendFiles/builder/concat_list.txt -c copy /home/zacharyrichmond/Documents/BlenderDocuments/blenderfiles/blendFiles/builder/output.mp4
+
+  
 """
 
 import array
@@ -436,6 +440,7 @@ def scale_uv_coords(obj, scale_x, scale_y):
         u, v = loop.uv
         loop.uv.x = 0.5 + (u - 0.5) * scale_x
         loop.uv.y = 0.5 + (v - 0.5) * scale_y
+
 
 
 def get_or_create_collection(name, hide_render=False):
@@ -870,9 +875,21 @@ class SceneBuilder:
 
         # Unwrap while `merged` is still visible/unkeyframed -- exactly one
         # object here, not thousands, so the per-call bpy.ops overhead
-        # smart_uv_unwrap normally batches against doesn't matter.
+        # smart_uv_unwrap normally batches against doesn't matter. Applies to
+        # every merge group alike -- a fresh wall dump ('wall_stage_*') or a
+        # previous section's rocks re-imported as scenery
+        # ('scenery_section_*') -- from either section, since this runs once
+        # per group regardless of which one it is.
+        #
+        # A fixed target scale (e.g. 0.691x/0.601y) doesn't behave
+        # predictably here: smart_project()'s raw output isn't reliably
+        # normalized to the 0-1 UV square -- it was ~1.0 for a small test
+        # mesh but ~8.8 for the true full-scale scenery merge (thousands of
+        # members), so the same "target" number landed very differently on
+        # different-sized piles. A relative 6x multiplier on whatever
+        # smart_project already produced is well-defined regardless of that.
         smart_uv_unwrap([merged])
-        scale_uv_coords(merged, 0.879, 0.639)
+        scale_uv_coords(merged, 6.0, 6.0)
 
         add_popin_visibility(merged, group_first_frame, global_first_frame)
 
@@ -976,17 +993,21 @@ def main():
     # 'wall_stage_2_dir0' together under one 'wall_stage_dir0' sub-collection
     # (their names differ only by the stage number, which family_key strips).
     # Give them the same rock_pbr material as the ground rocks, if it exists
-    # -- each 'wall_stage_*_dir0' pile was already unwrapped and UV-scaled
-    # by 0.879x/0.639y back in _bake_merged_group, so this is just the
-    # material assignment; nothing here needs to touch its UVs.
+    # -- each merged pile was already unwrapped and UV-scaled by
+    # 6x back in _bake_merged_group, so this is just the material
+    # assignment; nothing here needs to touch its UVs. Covers both a fresh
+    # wall dump ('wall_stage_*') and a previous section's rocks re-imported
+    # as static scenery ('scenery_section_*', see merge_group_key) --
+    # missing the latter left section 2's carried-over section-1 rocks
+    # textureless even though its own fresh dumps were textured correctly.
     rock_material = bpy.data.materials.get("rock_pbr")
     if rock_material is not None:
         wall_pile_objs = [o for o in all_objects_in_collection(instances_collection)
-                         if o.name.startswith("wall_stage_")]
+                         if o.name.startswith(("wall_stage_", "scenery_section_"))]
         for obj in wall_pile_objs:
             obj.data.materials.clear()
             obj.data.materials.append(rock_material)
-        print(f"  applied material 'rock_pbr' to {len(wall_pile_objs)} wall-pile object(s)")
+        print(f"  applied material 'rock_pbr' to {len(wall_pile_objs)} wall-pile/scenery-rock object(s)")
 
     if robot_texture is not None:
         folder, excludes_csv = robot_texture
@@ -1005,6 +1026,30 @@ def main():
 
     if world_append is not None:
         append_world(*world_append)
+
+    # The USA flag (a mesh with a Shrinkwrap modifier, appended as part of
+    # Collection 6) needs that modifier's target repointed at THIS run's own
+    # 'Chassis body' -- not whatever chassis happened to exist when the flag
+    # was last saved -- so it's done here rather than in that source file.
+    # It also needs to be parented to the chassis: the Shrinkwrap modifier's
+    # normal-projection ray only reaches the hull if the flag is already
+    # nearby, and with no parent the flag's own base position never moves,
+    # so once the chassis drives away the ray has nothing left to hit. The
+    # local offset below is fixed rather than derived from the chassis's
+    # current pose -- verified to sit inside the chassis mesh's own local
+    # footprint (x: -4.9..0.5, y: -1.34..1.34), which is all the Shrinkwrap
+    # modifier needs to find the hull and do the exact surface placement.
+    flag = next((o for o in bpy.data.objects if "usa-flag" in o.name.lower()), None)
+    chassis = bpy.data.objects.get("Chassis body")
+    if flag is not None and chassis is not None:
+        shrinkwrap = next((m for m in flag.modifiers if m.type == 'SHRINKWRAP'), None)
+        if shrinkwrap is not None:
+            shrinkwrap.target = chassis
+        flag.parent = chassis
+        flag.matrix_parent_inverse = mathutils.Matrix.Identity(4)
+        flag.rotation_euler.z = math.radians(-90)
+        flag.location = mathutils.Vector((-3.5337, 0.0304, 0.6827))
+        print(f"  parented '{flag.name}' to 'Chassis body' and set its Shrinkwrap target")
 
     bpy.context.scene.frame_start = first_frame
     bpy.context.scene.frame_end = last_frame
