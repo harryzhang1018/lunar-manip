@@ -1,5 +1,10 @@
 """Attach a Chrono::Postprocess Blender export to any Chrono scenario, unmodified.
 
+to run from my machine:
+conda run -n chrono python /home/zacharyrichmond/lunar-manip/scripts/export_any_chrono_run.py \
+    /home/zacharyrichmond/lunar-manip/scenarios/TrackedVeh_OrbitBuilder.py --fps 30 \
+    -- --headless --run-time 20
+    
 `TrackedVeh_OrbitBuilder.py` (see its `--export-blender` flag) wires up a
 `postprocess.ChBlender` by hand: construct it against the scenario's
 `ChSystem`, `AddAll()` the bodies that exist at that point, `ExportScript()`
@@ -15,6 +20,7 @@ via `Add`/`AddBody` (directly or via a vehicle model's internals), and the
 sim loop advances it via `DoStepDynamics` (or, for vehicle scenarios, via a
 `.Advance()` call -- see below). Monkey-patching those before the target
 script even imports `pychrono` gives the hooks needed:
+
 
   * every `Add`/`AddBody` call registers that item with a `ChBlender`
     exporter -- created on the very first call, so this also replaces

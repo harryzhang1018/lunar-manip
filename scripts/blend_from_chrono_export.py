@@ -61,9 +61,16 @@ second run's setup from deleting it before this script ever sees it):
     conda activate chrono
     cd lunar-manip
     python scenarios/TrackedVeh_OrbitBuilder.py --headless --export-blender
+    rm -rf DEMO_OUTPUT/BLENDER_section1
     mv DEMO_OUTPUT/BLENDER DEMO_OUTPUT/BLENDER_section1
     python scenarios/TrackedVeh_OrbitBuilder.py --headless --export-blender --continue
+    rm -rf DEMO_OUTPUT/BLENDER_section2
     mv DEMO_OUTPUT/BLENDER DEMO_OUTPUT/BLENDER_section2
+
+The `rm -rf` right before each `mv` isn't optional either: `mv` refuses to
+move a directory onto one that already exists and is non-empty, so a
+second run of this exact workflow (redoing a section, re-exporting after a
+scenario change) fails on the `mv` instead of overwriting the stale export.
 
 That last move isn't optional either, for the same reason as the first: leaving
 section 2 at the bare DEMO_OUTPUT/BLENDER path means any later run (a redo of
@@ -87,21 +94,32 @@ full command to render one section scene from chrono.
     conda activate chrono
     cd lunar-manip
     python scenarios/TrackedVeh_OrbitBuilder.py --headless --export-blender
+    rm -rf DEMO_OUTPUT/BLENDER_section1
     mv DEMO_OUTPUT/BLENDER DEMO_OUTPUT/BLENDER_section1
     python scenarios/TrackedVeh_OrbitBuilder.py --headless --export-blender --continue
+    rm -rf DEMO_OUTPUT/BLENDER_section2
     mv DEMO_OUTPUT/BLENDER DEMO_OUTPUT/BLENDER_section2
     blender --background --python scripts/blend_from_chrono_export.py -- \
-          DEMO_OUTPUT/BLENDER_section2\
-          ~/Documents/BlenderDocuments/blenderfiles/blendFiles/section2.blend 30 \
+          DEMO_OUTPUT/BLENDER_section1\
+          ~/Documents/BlenderDocuments/blenderfiles/blendFiles/section1.blend 30 \
           ~/Documents/BlenderDocuments/blenderfiles/blendFiles/orbit_builder2.blend "Collection.001" \
-          ~/Documents/BlenderDocuments/blenderfiles/blendFiles/orbit_builder2.blend "Collection 6" \
+          ~/Documents/BlenderDocuments/blenderfiles/blendFiles/section2PREVIOUS.blend "Collection 6" \
           --world ~/Documents/BlenderDocuments/blenderfiles/blendFiles/builder5.blend "World" \
           --texture ~/Downloads/rock rock \
           --texture ~/Poliigon/Library/Poliigon_PlasticMoldDryBlast_7495/2K "M113_TrackShoeLeft_shoe,M113_TrackShoeRight_shoe" \
           --robot-texture ~/Poliigon/Library/MetalGalvanizedSteelWorn001 "M113_TrackShoeLeft_shoe,M113_TrackShoeRight_shoe"
+     blender --background --python scripts/blend_from_chrono_export.py -- \
+              DEMO_OUTPUT/BLENDER_section2\
+              ~/Documents/BlenderDocuments/blenderfiles/blendFiles/section2.blend 30 \
+              ~/Documents/BlenderDocuments/blenderfiles/blendFiles/orbit_builder2.blend "Collection.001" \
+              ~/Documents/BlenderDocuments/blenderfiles/blendFiles/section2PREVIOUS.blend "Collection 6" \
+              --world ~/Documents/BlenderDocuments/blenderfiles/blendFiles/builder5.blend "World" \
+              --texture ~/Downloads/rock rock \
+              --texture ~/Poliigon/Library/Poliigon_PlasticMoldDryBlast_7495/2K "M113_TrackShoeLeft_shoe,M113_TrackShoeRight_shoe" \
+              --robot-texture ~/Poliigon/Library/MetalGalvanizedSteelWorn001 "M113_TrackShoeLeft_shoe,M113_TrackShoeRight_shoe"      
     cd /home/zacharyrichmond/Documents/BlenderDocuments/blenderfiles/blendFiles
-    blender -b section1.blend -s 12 -e 4048 -o //builder/builder1 -F FFMPEG -a
-    blender -b section2.blend -s 5 -e 5090 -o //builder/builder2 -F FFMPEG -a
+    blender -b section1.blend -s 12 -e 3810 -o //builder/builder1 -F FFMPEG -a
+    blender -b section2.blend -s 15 -e 5000 -o //builder/builder2 -F FFMPEG -a
     blender -b section1.blend -E CYCLES -s 12 -e 4048 -o //builder/builder1 -F FFMPEG -a
   printf "file '%s'\nfile '%s'\n" /home/zacharyrichmond/Documents/BlenderDocuments/blenderfiles/blendFiles/builder/builder10012-4048.mkv /home/zacharyrichmond/Documents/BlenderDocuments/blenderfiles/blendFiles/builder/builder20005-5090.mkv > /home/zacharyrichmond/Documents/BlenderDocuments/blenderfiles/blendFiles/builder/concat_list.txt
 

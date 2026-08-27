@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""render_logical.py -- render a frame range from the *logical* combined
+video for one section, as if its underlying .blend file(s) were one
+continuous timeline, even though --section2 is backed by two separate
+.blend files for technical reasons (each is its own Chrono system / export,
+see scripts/blend_from_chrono_export.py) rather than one merged file.
+
+Each file also has some unusable animation at its very start (and, for
+--section2, its end too -- motor spin-up, settling, etc.) that gets trimmed
+off automatically -- see the SECTIONS table below. Logical frame 1 is the
+first usable frame of the section's first file, and logical frame numbers
+keep counting up with no gap across a mode1 -> mode2 cut. Callers never see
+raw per-file frame numbers, trimmed-off frames, or the intermediate
+per-file clips -- only the final joined output.
+
+Usage:
+    scripts/render_logical.py [--section1|--section2] <start> <end> <output.mp4> [engine [samples]]
+
+--section1 renders data/section1.blend alone (its first 20 frames trimmed,
+no tail trim). --section2 (the default, for backward compatibility) renders
+the combined data/section2_mode1.blend -> data/section2_mode2.blend
+timeline. <start>/<end> are logical frame numbers (1-based, inclusive). A
+single still-frame render is just <start> == <end> -- give it a .png output
+path to get a still image instead of a one-frame video container.
+
+Examples:
+    # A clip crossing the section2 mode1 -> mode2 cut
+    scripts/render_logical.py --section2 3500 3700 data/builder/clip.mp4
+
+    # A clip from section1
+    scripts/render_logical.py --section1 100 300 data/builder/s1_clip.mp4
+
+    # One single frame, as a still image
+    scripts/render_logical.py 100 100 data/builder/frame100.png
+
+    # One single frame, as a one-frame video instead
+    scripts/render_logical.py 100 100 data/builder/frame100.mp4
+
+    # The whole trimmed, combined video (an end past the real last logical
+    # frame is clamped, so a large round number like this works fine)
+    scripts/render_logical.py 1 999999 data/builder/full.mp4
+
+    # Force Cycles instead of the default EEVEE
+    scripts/render_logical.py 1 999999 data/builder/full.mp4 CYCLES
+
+    # Force Cycles with 64 samples instead of whatever's baked into the file
+    scripts/render_logical.py 1 999999 data/builder/full.mp4 CYCLES 64
+"""
+
+import glob
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+DATA_DIR = os.path.join(REPO_ROOT, "data")
+PROBE_SCRIPT = os.path.join(SCRIPT_DIR, "_print_frame_range.py")
+CACHE_PATH = os.path.join(DATA_DIR, ".section_frame_range_cache.json")
+
+# `blender` in a non-interactive shell resolves to the old system 3.0.1, not
+# the aliased 5.1.2 (the alias only lives in ~/.bashrc, loaded by
+# interactive shells) -- so this defaults to the real 5.1.2 binary directly.
+BLENDER = os.environ.get(
+    "BLENDER",
+    "/home/zacharyrichmond/Downloads/blender-5.1.2-linux-x64/blender-5.1.2-linux-x64/blender",
+)
+
+# section number -> [(filename in data/, frames to drop off the start,
+# frames to drop off the end), ...], in logical playback order. See
+# data/README_renders.md for what these trims are covering.
+SECTIONS = {
+    1: [("section1.blend", 20, 0)],
+    2: [
+        ("section2_mode1.blend", 12, 200),
+        ("section2_mode2.blend", 193, 50),
+    ],
+}
+
+
+def _load_cache():
+    if os.path.exists(CACHE_PATH):
+        with open(CACHE_PATH) as f:
+            return json.load(f)
+    return {}
+
+
+def _save_cache(cache):
+    with open(CACHE_PATH, "w") as f:
+        json.dump(cache, f, indent=2)
+
+
+def probe_frame_range(blend_path):
+    """(frame_start, frame_end) baked into `blend_path`'s scene, cached by
+    the file's mtime -- opening a 100MB+ .blend just to read two ints is
+    slow enough to not want to repeat it on every render."""
+    mtime = os.path.getmtime(blend_path)
+    cache = _load_cache()
+    entry = cache.get(blend_path)
+    if entry and entry["mtime"] == mtime:
+        return entry["frame_start"], entry["frame_end"]
+
+    result = subprocess.run(
+        [BLENDER, "--factory-startup", "--background", blend_path, "--python", PROBE_SCRIPT],
+        capture_output=True, text=True, check=True,
+    )
+    line = next(l for l in result.stdout.splitlines() if l.startswith("FRAME_RANGE"))
+    _, start, end = line.split()
+    frame_start, frame_end = int(start), int(end)
+
+    cache[blend_path] = {"mtime": mtime, "frame_start": frame_start, "frame_end": frame_end}
+    _save_cache(cache)
+    return frame_start, frame_end
+
+
+def usable_ranges(section):
+    """[(blend_path, usable_start, usable_end), ...] for every file in
+    `section`, in logical playback order, after applying each file's
+    head/tail trim."""
+    ranges = []
+    for filename, head_trim, tail_trim in SECTIONS[section]:
+        blend_path = os.path.join(DATA_DIR, filename)
+        frame_start, frame_end = probe_frame_range(blend_path)
+        usable_start = frame_start + head_trim
+        usable_end = frame_end - tail_trim
+        if usable_start > usable_end:
+            raise SystemExit(
+                f"{filename}: trim removes its entire usable range "
+                f"(baked {frame_start}-{frame_end}, trimmed by {head_trim}/{tail_trim})")
+        ranges.append((blend_path, usable_start, usable_end))
+    return ranges
+
+
+def logical_to_segments(section, logical_start, logical_end):
+    """Split a [logical_start, logical_end] request into per-file (blend_path,
+    file_start, file_end) segments, clamped to what's actually available."""
+    segments = []
+    logical_cursor = 1
+    for blend_path, usable_start, usable_end in usable_ranges(section):
+        length = usable_end - usable_start + 1
+        section_logical_start = logical_cursor
+        section_logical_end = logical_cursor + length - 1
+
+        overlap_start = max(logical_start, section_logical_start)
+        overlap_end = min(logical_end, section_logical_end)
+        if overlap_start <= overlap_end:
+            file_start = usable_start + (overlap_start - section_logical_start)
+            file_end = usable_start + (overlap_end - section_logical_start)
+            segments.append((blend_path, file_start, file_end))
+
+        logical_cursor = section_logical_end + 1
+
+    total = logical_cursor - 1
+    if not segments:
+        raise SystemExit(
+            f"requested logical range {logical_start}-{logical_end} is out of bounds "
+            f"(combined timeline is 1-{total})")
+    return segments, total
+
+
+def render_segment(blend_path, file_start, file_end, engine, samples=None, as_png=False):
+    """Render one file's frame range into its own temp dir (so Blender's
+    output filename, which we don't control, can't collide across segments
+    or across concurrent runs) and return the resulting clip/image path.
+
+    `as_png` renders `file_start` as a single still image (`-F PNG -f`)
+    instead of an `-s`/`-e`/`-a` video range -- only valid when
+    file_start == file_end, which main() enforces before calling this.
+
+    `samples` overrides the render sample count on whichever engine ends up
+    active (the one just set by `-E`, or the file's own default if `engine`
+    is None) -- left alone (None) means "whatever's baked into the file"."""
+    tmp_dir = tempfile.mkdtemp(dir=DATA_DIR, prefix=".render_logical_")
+    try:
+        engine_args = ["-E", engine] if engine else []
+        samples_args = []
+        if samples is not None:
+            # runs after -E above (Blender applies args in order), so this
+            # sees whichever engine is actually active for this render
+            samples_args = ["--python-expr", (
+                "import bpy; scn = bpy.context.scene; eng = scn.render.engine; "
+                f"scn.cycles.samples = {samples} if eng == 'CYCLES' else scn.cycles.samples; "
+                f"scn.eevee.taa_render_samples = {samples} if eng == "
+                "'BLENDER_EEVEE' else scn.eevee.taa_render_samples"
+            )]
+        out_prefix = os.path.relpath(tmp_dir, DATA_DIR) + "/clip"
+        # --factory-startup skips the user's installed add-ons (e.g. a
+        # flaky Poliigon add-on background thread has been observed
+        # segfaulting Blender during a --background run) -- nothing this
+        # pipeline renders depends on any add-on being active.
+        base_cmd = [BLENDER, "--factory-startup", "-b", blend_path, *engine_args, *samples_args]
+        if as_png:
+            cmd = base_cmd + ["-o", f"//{out_prefix}", "-F", "PNG", "-f", str(file_start)]
+        else:
+            cmd = base_cmd + ["-s", str(file_start), "-e", str(file_end),
+                              "-o", f"//{out_prefix}", "-F", "FFMPEG", "-a"]
+        subprocess.run(cmd, check=True)
+        clips = glob.glob(os.path.join(tmp_dir, "clip*"))
+        if len(clips) != 1:
+            raise SystemExit(f"expected exactly one rendered output in {tmp_dir}, found {clips}")
+        return clips[0], tmp_dir
+    except BaseException:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+
+
+def concat_clips(clip_paths, output_path):
+    list_file = tempfile.NamedTemporaryFile(
+        mode="w", dir=DATA_DIR, suffix=".txt", delete=False)
+    try:
+        for clip in clip_paths:
+            list_file.write(f"file '{os.path.abspath(clip)}'\n")
+        list_file.close()
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file.name,
+             "-c", "copy", output_path],
+            check=True,
+        )
+    finally:
+        os.unlink(list_file.name)
+
+
+def main():
+    args = sys.argv[1:]
+    section = 2
+    if args and args[0] in ("--section1", "--section2"):
+        section = int(args[0][len("--section"):])
+        args = args[1:]
+
+    if len(args) not in (3, 4, 5):
+        raise SystemExit(
+            "usage: render_logical.py [--section1|--section2] "
+            "<start_frame> <end_frame> <output.mp4> [engine [samples]]")
+    logical_start = int(args[0])
+    logical_end = int(args[1])
+    output_path = os.path.abspath(args[2])
+    engine = args[3] if len(args) >= 4 else None
+    samples = int(args[4]) if len(args) == 5 else None
+
+    as_png = output_path.lower().endswith(".png")
+    if as_png and logical_start != logical_end:
+        raise SystemExit(
+            "PNG output only supports a single frame -- pass the same value for "
+            "<start> and <end>, or use a .mp4/.mkv output for a range")
+
+    segments, total = logical_to_segments(section, logical_start, logical_end)
+    print(f"combined logical timeline: 1-{total}; rendering "
+         f"{len(segments)} segment(s) for requested {logical_start}-{logical_end}")
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+    tmp_dirs = []
+    clip_paths = []
+    try:
+        for blend_path, file_start, file_end in segments:
+            print(f"  {os.path.basename(blend_path)}: frames {file_start}-{file_end}")
+            clip_path, tmp_dir = render_segment(
+                blend_path, file_start, file_end, engine, samples, as_png)
+            clip_paths.append(clip_path)
+            tmp_dirs.append(tmp_dir)
+
+        if len(clip_paths) == 1:
+            shutil.move(clip_paths[0], output_path)
+        else:
+            concat_clips(clip_paths, output_path)
+    finally:
+        for tmp_dir in tmp_dirs:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    print(f"wrote {output_path}")
+
+
+if __name__ == "__main__":
+    main()

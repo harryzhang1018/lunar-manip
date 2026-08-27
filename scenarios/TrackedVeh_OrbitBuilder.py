@@ -579,6 +579,14 @@ SECTION_STEP_DEG = WALL_RIDGE_SPAN_DEG
 # rock width plus a little air -- the rock being laid and the one it would touch
 # are each ~0.26 m across, so 0.35 m of centre-to-centre clearance leaves a gap.
 SECTION_CLEARANCE = 0.35
+# This build is only ever meant to run two sections (see the module docstring's
+# two-command workflow). A third `--continue` doesn't fail cleanly on its own --
+# SECTION_STEP_DEG is sized for one section's worth of arc, so by section 3 the
+# wall built by sections 1+2 has already run past where its build arc would
+# start, and it dies mid-drive with a ValueError from `ground_targets` instead
+# of at startup. Capped here so that happens immediately, with a clear reason,
+# rather than after ~170s of simulation.
+MAX_SECTIONS = 2
 # The state file `--continue` reads when it is given no path of its own. Note that
 # the run then *rewrites* this same file at the end, with the imported rocks and
 # the new section in it -- the whole file is read into memory before anything is
@@ -2039,6 +2047,13 @@ def main():
     # same path safe.
     carried = read_rock_rows(resume_file) if resume_file else []
     section = max((row_section(row) for row in carried), default=0) + 1
+    if section > MAX_SECTIONS:
+        raise ValueError(
+            f"{resume_file} already holds section(s) up to "
+            f"{max(row_section(row) for row in carried)}; --continue would "
+            f"start section {section}, past MAX_SECTIONS ({MAX_SECTIONS}). "
+            "This build is only meant to run two sections -- start over from "
+            "a fresh (non-continue) run if you want to redo section 1.")
     occupied_to_deg = occupied_arc_end(carried)
     if resume_file:
         sections = sorted({row_section(row) for row in carried})

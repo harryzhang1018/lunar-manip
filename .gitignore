@@ -7,6 +7,17 @@ __pycache__/
 # Rendered frames / outputs
 IMG/
 *.mp4
+data/builder/
+data/.section_frame_range_cache.json
+data/.render_logical_*/
+
+# Blender's own backup file, written alongside on every save
+*.blend1
+
+# Raw Chrono export/simulation output -- the intermediate data
+# blend_from_chrono_export.py consumes, not source
+DEMO_OUTPUT/
+artifacts/
 
 # Claude Code local settings
 .claude/settings.local.json

@@ -1,0 +1,2 @@
+data/*.blend filter=lfs diff=lfs merge=lfs -text
+data/textures/* filter=lfs diff=lfs merge=lfs -text
