@@ -51,8 +51,22 @@ Usage (via the real Blender executable's bundled Python):
     --scm                       build real regolith deformation geometry
                                  from every loaded rank's rank_N_scm.bin, if
                                  present -- see "About SCM terrain" below
+    --scm-texture DIR            PBR texture set (auto-detected like
+                                 --texture) applied to the SCM rut mesh,
+                                 tiled by real-world distance and mixed
+                                 toward grey by --scm-grey-shift. Falls back
+                                 to a flat gray without this.
+    --scm-grey-shift F           0..1, how much to mix --scm-texture's color
+                                 toward neutral grey (default 0.3)
     --texture DIR family[,family...]     PBR-texture objects in these groups
-    --robot-texture DIR exclude_families  same, for everything else (see
+    --part-texture DIR substr[,substr...]  PBR-texture objects by NAME
+                                 substring rather than group (e.g. track
+                                 shoes, which have no group of their own) --
+                                 excluded from --robot-texture below
+    --robot-texture DIR exclude_families  same, for everything else, EXCEPT
+                                 any part whose manifest color is genuinely
+                                 non-gray (a real color-coded part, e.g. a
+                                 reddish chassis, is left alone) (see
                                            blend_from_chrono_export.py's
                                            --robot-texture for the exact rule)
     --world BLEND_FILE COLLECTION_OR_WORLD_NAME   append a world/environment
@@ -820,6 +834,15 @@ def build_shape(shape, body_empty, name, mesh_cache, mesh_dir, mesh_map, fit_aab
         child = bpy.context.active_object
         size = shape.get("size") or [0.1, 0.1, 0.1]
         child.scale = (size[0] / 2.0, size[1] / 2.0, size[2] / 2.0)
+    elif shape.get("type") == "cylinder":
+        # Blender's cylinder primitive is centered at its own origin and
+        # runs along local Z, `depth` long -- exactly the frame the shape's
+        # own pos/rot (applied via the holder Empty below) already expects,
+        # same as every other shape type here.
+        radius = shape.get("radius", 0.05)
+        height = shape.get("height", 0.1)
+        bpy.ops.mesh.primitive_cylinder_add(radius=radius, depth=height)
+        child = bpy.context.active_object
     else:
         src = shape.get("file")
         if src:
@@ -1042,7 +1065,18 @@ def build_heightfield_mesh(rows, lo, hi, normalize_observed):
     for r in range(h):
         for c in range(w):
             x = x0 + (c / (w - 1)) * length if w > 1 else (lo[0] + hi[0]) / 2
-            y = y0 + (r / (h - 1)) * width if h > 1 else (lo[1] + hi[1]) / 2
+            # `r` counts down from the image's own top row (rows[0], per
+            # read_heightmap's plain top-down scanline order) -- but the
+            # reference tool (replay_run.py's terrain_mesh()) loads the same
+            # heightmap through pyvista/VTK, which flips PNGs vertically on
+            # load (row 0 becomes the file's BOTTOM row; confirmed
+            # empirically against a real VTK read, not assumed), and maps
+            # ITS row 0 to the lowest Y. So the file's bottom row is what
+            # belongs at y0, not the top row -- inverting this put the
+            # terrain's real features (the graded pad, the crater layout)
+            # upside-down relative to the vehicles' real (unaffected, from
+            # trajectory data) positions.
+            y = y0 + ((h - 1 - r) / (h - 1)) * width if h > 1 else (lo[1] + hi[1]) / 2
             z = (lo[2] + (hi[2] - lo[2]) * (rows[r][c] - grey_min) / grey_span
                 if grey_span > 0 else lo[2])
             grid[r][c] = bm.verts.new((x, y, z))
@@ -1093,14 +1127,23 @@ def load_scm_terrain(dataset, ranks):
     return delta, plane, nodes
 
 
-def build_scm_terrain_mesh(nodes, delta, plane):
+def build_scm_terrain_mesh(nodes, delta, plane, uv_tile_meters=2.0):
     """A mesh from real SCM deformation nodes (load_scm_terrain's output):
     one quad per 2x2 block of nodes that are ALL present, so genuinely
     disconnected patches (a rover's ruts are a lane, not a filled area --
     see replay_run.py's deformed_cells docstring) stay disconnected instead
-    of being bridged across real gaps with fabricated geometry."""
+    of being bridged across real gaps with fabricated geometry.
+
+    UVs come straight from each node's own (i, j) grid index * delta (its
+    real world-space spacing), divided by `uv_tile_meters` -- unlike the
+    heightfield mesh (one clean rectangular grid, 0..1 across the whole
+    patch), this mesh is a sparse, irregularly-shaped set of disconnected
+    quads, so there's no single patch extent to normalize against; tiling
+    by a fixed real-world distance instead keeps texture density consistent
+    regardless of how big or small a given rank's disturbed area is."""
     mesh = bpy.data.meshes.new("scm_terrain")
     bm = bmesh.new()
+    uv_layer = bm.loops.layers.uv.new()
     verts = {}
     for (i, j), z in nodes.items():
         verts[(i, j)] = bm.verts.new(scm_node_world_pos(i, j, z, delta, plane))
@@ -1112,19 +1155,74 @@ def build_scm_terrain_mesh(nodes, delta, plane):
         v01 = verts.get((i, j + 1))
         v11 = verts.get((i + 1, j + 1))
         if v10 is not None and v01 is not None and v11 is not None:
-            bm.faces.new((v00, v10, v11, v01))
+            face = bm.faces.new((v00, v10, v11, v01))
+            for loop, (ii, jj) in zip(face.loops, ((i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1))):
+                loop[uv_layer].uv = (ii * delta / uv_tile_meters, jj * delta / uv_tile_meters)
             n_faces += 1
     bm.normal_update()
     bm.to_mesh(mesh)
     bm.free()
     obj = bpy.data.objects.new("scm_terrain", mesh)
     bpy.context.scene.collection.objects.link(obj)
-    # Same flat gray the undisturbed terrain patch reports in static_props.jsonl
-    # (this data carries no color of its own) -- close enough for a default,
-    # override with --texture scm_terrain for real PBR regolith.
-    obj.data.materials.append(get_color_material((0.55, 0.5, 0.45)))
     print(f"  built SCM terrain: {len(nodes)} nodes, {n_faces} quads")
     return obj
+
+
+def build_scm_color_material(detail_folder, grey_shift=0.3):
+    """A regolith material for the SCM rut mesh: `detail_folder`'s color and
+    normal maps (auto-detected via find_pbr_maps, tiled through the mesh's
+    own UVs -- see build_scm_terrain_mesh), mixed toward neutral grey by
+    `grey_shift` (0=texture's own color unchanged, 1=flat grey) -- unlike
+    the terrain's macro+detail blend, there's no separate base photo here to
+    preserve contrast against, so this is a plain color mix rather than an
+    OVERLAY (see build_terrain_detail_material's docstring for why OVERLAY
+    matters there and not here)."""
+    maps = find_pbr_maps(detail_folder)
+    print(f"  scm terrain texture from {detail_folder}: {[k for k, v in maps.items() if v]}")
+
+    mat = bpy.data.materials.new("scm_terrain_color")
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    bsdf = nodes.get("Principled BSDF")
+
+    color_out = None
+    if maps.get("color"):
+        color_img = bpy.data.images.load(maps["color"])
+        color_img.colorspace_settings.name = 'sRGB'
+        color_node = nodes.new("ShaderNodeTexImage")
+        color_node.image = color_img
+        color_node.location = (-500, 200)
+        grey = nodes.new("ShaderNodeMixRGB")
+        grey.blend_type = 'MIX'
+        grey.inputs["Fac"].default_value = grey_shift
+        grey.inputs["Color2"].default_value = (0.5, 0.5, 0.5, 1.0)
+        grey.location = (-200, 200)
+        links.new(color_node.outputs["Color"], grey.inputs["Color1"])
+        color_out = grey.outputs["Color"]
+    if color_out is not None:
+        links.new(color_out, bsdf.inputs["Base Color"])
+
+    if maps.get("normal"):
+        normal_img = bpy.data.images.load(maps["normal"])
+        normal_img.colorspace_settings.name = 'Non-Color'
+        normal_tex = nodes.new("ShaderNodeTexImage")
+        normal_tex.image = normal_img
+        normal_tex.location = (-500, -100)
+        normal_map = nodes.new("ShaderNodeNormalMap")
+        normal_map.location = (-200, -100)
+        links.new(normal_tex.outputs["Color"], normal_map.inputs["Color"])
+        links.new(normal_map.outputs["Normal"], bsdf.inputs["Normal"])
+
+    if maps.get("roughness"):
+        rough_img = bpy.data.images.load(maps["roughness"])
+        rough_img.colorspace_settings.name = 'Non-Color'
+        rough_tex = nodes.new("ShaderNodeTexImage")
+        rough_tex.image = rough_img
+        rough_tex.location = (-500, -350)
+        links.new(rough_tex.outputs["Color"], bsdf.inputs["Roughness"])
+
+    return mat
 
 
 def build_static_props(dataset, mesh_cache, mesh_dir, mesh_map, fit_aabb):
@@ -1281,10 +1379,11 @@ def parse_args():
     opts = {
         "ranks": None, "groups": None, "mesh_dir": None, "mesh_map": None,
         "fit_aabb": True, "start": None, "end": None, "stride": 1,
-        "no_static": False, "textures": [], "robot_texture": None,
+        "no_static": False, "textures": [], "part_textures": [], "robot_texture": None,
         "world_append": None, "fps": 30, "heightmap": None, "scm": False,
         "terrain_texture": None, "terrain_detail_texture": None,
-        "terrain_detail_scale": 40.0, "appends": [],
+        "terrain_detail_scale": 40.0, "scm_texture": None, "scm_grey_shift": 0.3,
+        "appends": [],
     }
     i = 0
     while i < len(rest):
@@ -1335,8 +1434,17 @@ def parse_args():
         elif arg == "--scm":
             opts["scm"] = True
             i += 1
+        elif arg == "--scm-texture":
+            opts["scm_texture"] = rest[i + 1]
+            i += 2
+        elif arg == "--scm-grey-shift":
+            opts["scm_grey_shift"] = float(rest[i + 1])
+            i += 2
         elif arg == "--texture":
             opts["textures"].append((rest[i + 1], rest[i + 2].split(",")))
+            i += 3
+        elif arg == "--part-texture":
+            opts["part_textures"].append((rest[i + 1], rest[i + 2].split(",")))
             i += 3
         elif arg == "--robot-texture":
             excludes = [f for f in rest[i + 2].split(",") if f]
@@ -1421,6 +1529,14 @@ def main():
         print(f"  loaded SCM deformation: {len(nodes)} node(s) across rank(s) {ranks}")
         if nodes:
             scm_obj = build_scm_terrain_mesh(nodes, delta, plane)
+            if opts["scm_texture"]:
+                mat = build_scm_color_material(opts["scm_texture"], opts["scm_grey_shift"])
+                scm_obj.data.materials.append(mat)
+            else:
+                # No texture supplied -- same flat gray the undisturbed
+                # terrain patch reports in static_props.jsonl (this data
+                # carries no color of its own).
+                scm_obj.data.materials.append(get_color_material((0.55, 0.5, 0.45)))
             all_texturable.append(("scm_terrain", scm_obj))
 
     for append_path, collection_name in opts["appends"]:
@@ -1457,17 +1573,55 @@ def main():
             obj.data.materials.append(mat)
         print(f"  applied material '{mat.name}' to {len(targets)} object(s) across {families}")
 
+    # Objects matched by --part-texture (name substring, not group -- e.g.
+    # track shoes, which live inside the "builder"/"collector" groups
+    # rather than having a group of their own) are painted here and then
+    # excluded from --robot-texture below, same split
+    # blend_from_chrono_export.py uses for track shoes vs. everything else
+    # (plastic tread, metal body).
+    part_textured = set()
+    for folder, substrings in opts["part_textures"]:
+        mat = build_pbr_material_from_folder("_".join(substrings) + "_pbr", folder)
+        targets = [o for objs in mesh_objs_by_group.values() for o in objs
+                  if any(s in o.name for s in substrings)]
+        smart_uv_unwrap(targets)
+        for obj in targets:
+            obj.data.materials.clear()
+            obj.data.materials.append(mat)
+            part_textured.add(obj)
+        print(f"  applied material '{mat.name}' to {len(targets)} object(s) matching {substrings}")
+
+    def has_real_color(obj):
+        """True if `obj`'s current material is a genuinely distinguishing
+        (non-gray) manifest color -- e.g. the chassis's reddish paint --
+        rather than an achromatic near-white/gray/black placeholder (like
+        the many parts whose manifest color happened to be literal white).
+        Robot-texturing skips these so real color-coded parts aren't
+        overwritten with a generic metal material."""
+        if not obj.data.materials or obj.data.materials[0] is None:
+            return False
+        mat = obj.data.materials[0]
+        if not mat.use_nodes or not mat.node_tree:
+            return False
+        bsdf = mat.node_tree.nodes.get("Principled BSDF")
+        if bsdf is None or bsdf.inputs["Base Color"].is_linked:
+            return False
+        r, g, b = bsdf.inputs["Base Color"].default_value[:3]
+        return (max(r, g, b) - min(r, g, b)) > 0.05
+
     if opts["robot_texture"]:
         folder, excludes = opts["robot_texture"]
         mat = build_pbr_material_from_folder("robot_pbr", folder)
         excluded_groups = set(excludes)
         targets = [o for g, objs in mesh_objs_by_group.items() if g not in excluded_groups
-                  for o in objs if g != "rock" and not g.startswith("static")]
+                  for o in objs if g != "rock" and not g.startswith("static")
+                  and not has_real_color(o) and o not in part_textured]
         smart_uv_unwrap(targets)
         for obj in targets:
             obj.data.materials.clear()
             obj.data.materials.append(mat)
-        print(f"  applied material 'robot_pbr' to {len(targets)} object(s), excluding {excluded_groups}")
+        print(f"  applied material 'robot_pbr' to {len(targets)} object(s), excluding {excluded_groups}"
+             " (and any part with its own distinguishing color)")
 
     # ---- render settings, matching blend_from_chrono_export.py's conventions ----
     scene.render.engine = 'BLENDER_EEVEE'

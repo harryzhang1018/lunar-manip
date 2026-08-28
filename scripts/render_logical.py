@@ -14,7 +14,9 @@ raw per-file frame numbers, trimmed-off frames, or the intermediate
 per-file clips -- only the final joined output.
 
 Usage:
-    scripts/render_logical.py [--section1|--section2] <start> <end> <output.mp4> [engine [samples]]
+    scripts/render_logical.py [--section1|--section2] \
+        [--overview|--chaseCollector|--chaseBuilder|--combined] \
+        <start> <end> <output.mp4> [engine [samples]]
 
 --section1 renders data/section1.blend alone (its first 20 frames trimmed,
 no tail trim). --section2 (the default, for backward compatibility) renders
@@ -23,12 +25,33 @@ timeline. <start>/<end> are logical frame numbers (1-based, inclusive). A
 single still-frame render is just <start> == <end> -- give it a .png output
 path to get a still image instead of a one-frame video container.
 
+data/section1.blend has three cameras baked in (see
+tools/render_site_anim.py in the AMD-UW render pipeline that produced it):
+an overhead 'cam_overview' and two vehicle-following chase cams,
+'cam_chase_a_r1_collector' (--chaseCollector) and 'cam_chase_b_r8_builder'
+(--chaseBuilder). --combined (the default whenever --section1 is used and
+none of these flags is given explicitly) renders overview and
+chaseCollector and places them side by side, overview on the left,
+chaseCollector on the right -- chaseBuilder is standalone-only
+(--chaseBuilder) and never appears in the split screen. These flags only
+apply to --section1 -- --section2's files each have a single fixed camera,
+so passing one there fails loudly instead of silently doing nothing.
+
 Examples:
     # A clip crossing the section2 mode1 -> mode2 cut
     scripts/render_logical.py --section2 3500 3700 data/builder/clip.mp4
 
-    # A clip from section1
+    # A clip from section1, overview | chaseCollector side by side (the default)
     scripts/render_logical.py --section1 100 300 data/builder/s1_clip.mp4
+
+    # Just the overhead camera
+    scripts/render_logical.py --section1 --overview 100 300 data/builder/s1_overview.mp4
+
+    # Just the collector chase camera
+    scripts/render_logical.py --section1 --chaseCollector 100 300 data/builder/s1_chase.mp4
+
+    # Just the builder chase camera (never part of --combined)
+    scripts/render_logical.py --section1 --chaseBuilder 100 300 data/builder/s1_builder.mp4
 
     # One single frame, as a still image
     scripts/render_logical.py 100 100 data/builder/frame100.png
@@ -59,7 +82,21 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
 DATA_DIR = os.path.join(REPO_ROOT, "data")
 PROBE_SCRIPT = os.path.join(SCRIPT_DIR, "_print_frame_range.py")
+SET_CAMERA_SCRIPT = os.path.join(SCRIPT_DIR, "_set_camera.py")
 CACHE_PATH = os.path.join(DATA_DIR, ".section_frame_range_cache.json")
+
+# --overview/--chaseCollector/--chaseBuilder/--combined -> the object name of
+# that camera in data/section1.blend (see tools/render_site_anim.py's
+# `cameras` dict in the AMD-UW render pipeline this file came from). Only
+# section1 has multiple cameras baked in -- section2's files each have one
+# fixed camera already. --combined (in main()) only ever pairs overview
+# with chaseCollector -- chaseBuilder is standalone-only.
+CAMERA_NAMES = {
+    "overview": "cam_overview",
+    "chaseCollector": "cam_chase_a_r1_collector",
+    "chaseBuilder": "cam_chase_b_r8_builder",
+}
+CAMERA_MODES = (*CAMERA_NAMES, "combined")
 
 # `blender` in a non-interactive shell resolves to the old system 3.0.1, not
 # the aliased 5.1.2 (the alias only lives in ~/.bashrc, loaded by
@@ -161,7 +198,8 @@ def logical_to_segments(section, logical_start, logical_end):
     return segments, total
 
 
-def render_segment(blend_path, file_start, file_end, engine, samples=None, as_png=False):
+def render_segment(blend_path, file_start, file_end, engine, samples=None, as_png=False,
+                   camera_name=None):
     """Render one file's frame range into its own temp dir (so Blender's
     output filename, which we don't control, can't collide across segments
     or across concurrent runs) and return the resulting clip/image path.
@@ -172,7 +210,11 @@ def render_segment(blend_path, file_start, file_end, engine, samples=None, as_pn
 
     `samples` overrides the render sample count on whichever engine ends up
     active (the one just set by `-E`, or the file's own default if `engine`
-    is None) -- left alone (None) means "whatever's baked into the file"."""
+    is None) -- left alone (None) means "whatever's baked into the file".
+
+    `camera_name` switches the active scene camera before rendering (see
+    scripts/_set_camera.py) -- left alone (None) means "whatever camera is
+    already set in the file"."""
     tmp_dir = tempfile.mkdtemp(dir=DATA_DIR, prefix=".render_logical_")
     try:
         engine_args = ["-E", engine] if engine else []
@@ -191,13 +233,19 @@ def render_segment(blend_path, file_start, file_end, engine, samples=None, as_pn
         # flaky Poliigon add-on background thread has been observed
         # segfaulting Blender during a --background run) -- nothing this
         # pipeline renders depends on any add-on being active.
-        base_cmd = [BLENDER, "--factory-startup", "-b", blend_path, *engine_args, *samples_args]
+        base_cmd = [BLENDER, "--factory-startup", "-b", blend_path,
+                    "--python", SET_CAMERA_SCRIPT, *engine_args, *samples_args]
         if as_png:
             cmd = base_cmd + ["-o", f"//{out_prefix}", "-F", "PNG", "-f", str(file_start)]
         else:
             cmd = base_cmd + ["-s", str(file_start), "-e", str(file_end),
                               "-o", f"//{out_prefix}", "-F", "FFMPEG", "-a"]
-        subprocess.run(cmd, check=True)
+        env = dict(os.environ)
+        if camera_name:
+            env["RENDER_LOGICAL_CAMERA"] = camera_name
+        else:
+            env.pop("RENDER_LOGICAL_CAMERA", None)
+        subprocess.run(cmd, check=True, env=env)
         clips = glob.glob(os.path.join(tmp_dir, "clip*"))
         if len(clips) != 1:
             raise SystemExit(f"expected exactly one rendered output in {tmp_dir}, found {clips}")
@@ -223,6 +271,53 @@ def concat_clips(clip_paths, output_path):
         os.unlink(list_file.name)
 
 
+def hstack_clips(left_path, right_path, output_path, as_png):
+    """Composite two already-rendered clips/images side by side (left |
+    right) into one output -- used for --combined (overview | chase).
+    Unlike concat_clips this re-encodes (hstack draws a new frame out of
+    two), so it can't be a plain stream copy."""
+    if as_png:
+        cmd = ["ffmpeg", "-y", "-i", left_path, "-i", right_path,
+              "-filter_complex", "hstack=inputs=2", output_path]
+    else:
+        cmd = ["ffmpeg", "-y", "-i", left_path, "-i", right_path,
+              "-filter_complex", "[0:v][1:v]hstack=inputs=2[o]", "-map", "[o]",
+              "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", output_path]
+    subprocess.run(cmd, check=True)
+
+
+def render_camera(section, logical_start, logical_end, output_path, engine, samples, as_png,
+                  camera_name):
+    """Render the full requested logical range (joining across a
+    section2-style multi-file cut if needed) from one camera into
+    `output_path`. This is the whole single-camera pipeline; --combined
+    calls it twice (once per camera) and composites the results."""
+    segments, total = logical_to_segments(section, logical_start, logical_end)
+    print(f"combined logical timeline: 1-{total}; rendering "
+         f"{len(segments)} segment(s) for requested {logical_start}-{logical_end}"
+         f"{f' (camera: {camera_name})' if camera_name else ''}")
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+    tmp_dirs = []
+    clip_paths = []
+    try:
+        for blend_path, file_start, file_end in segments:
+            print(f"  {os.path.basename(blend_path)}: frames {file_start}-{file_end}")
+            clip_path, tmp_dir = render_segment(
+                blend_path, file_start, file_end, engine, samples, as_png, camera_name)
+            clip_paths.append(clip_path)
+            tmp_dirs.append(tmp_dir)
+
+        if len(clip_paths) == 1:
+            shutil.move(clip_paths[0], output_path)
+        else:
+            concat_clips(clip_paths, output_path)
+    finally:
+        for tmp_dir in tmp_dirs:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def main():
     args = sys.argv[1:]
     section = 2
@@ -230,9 +325,17 @@ def main():
         section = int(args[0][len("--section"):])
         args = args[1:]
 
+    camera_mode = None
+    if args and args[0].startswith("--") and args[0][2:] in CAMERA_MODES:
+        camera_mode = args[0][2:]
+        args = args[1:]
+    elif section == 1:
+        camera_mode = "combined"  # data/section1.blend's default view
+
     if len(args) not in (3, 4, 5):
         raise SystemExit(
             "usage: render_logical.py [--section1|--section2] "
+            "[--overview|--chaseCollector|--chaseBuilder|--combined] "
             "<start_frame> <end_frame> <output.mp4> [engine [samples]]")
     logical_start = int(args[0])
     logical_end = int(args[1])
@@ -246,28 +349,25 @@ def main():
             "PNG output only supports a single frame -- pass the same value for "
             "<start> and <end>, or use a .mp4/.mkv output for a range")
 
-    segments, total = logical_to_segments(section, logical_start, logical_end)
-    print(f"combined logical timeline: 1-{total}; rendering "
-         f"{len(segments)} segment(s) for requested {logical_start}-{logical_end}")
-
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-
-    tmp_dirs = []
-    clip_paths = []
-    try:
-        for blend_path, file_start, file_end in segments:
-            print(f"  {os.path.basename(blend_path)}: frames {file_start}-{file_end}")
-            clip_path, tmp_dir = render_segment(
-                blend_path, file_start, file_end, engine, samples, as_png)
-            clip_paths.append(clip_path)
-            tmp_dirs.append(tmp_dir)
-
-        if len(clip_paths) == 1:
-            shutil.move(clip_paths[0], output_path)
-        else:
-            concat_clips(clip_paths, output_path)
-    finally:
-        for tmp_dir in tmp_dirs:
+    if camera_mode != "combined":
+        camera_name = CAMERA_NAMES.get(camera_mode)
+        render_camera(section, logical_start, logical_end, output_path, engine, samples,
+                     as_png, camera_name)
+    else:
+        # Always overview | chaseCollector -- chaseBuilder is standalone-only
+        # (--chaseBuilder), never part of the split screen.
+        tmp_dir = tempfile.mkdtemp(dir=DATA_DIR, prefix=".render_logical_combined_")
+        try:
+            ext = ".png" if as_png else ".mp4"
+            overview_path = os.path.join(tmp_dir, f"overview{ext}")
+            chase_path = os.path.join(tmp_dir, f"chaseCollector{ext}")
+            render_camera(section, logical_start, logical_end, overview_path, engine, samples,
+                         as_png, CAMERA_NAMES["overview"])
+            render_camera(section, logical_start, logical_end, chase_path, engine, samples,
+                         as_png, CAMERA_NAMES["chaseCollector"])
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+            hstack_clips(overview_path, chase_path, output_path, as_png)
+        finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
     print(f"wrote {output_path}")
