@@ -5,7 +5,7 @@
 Use [`scripts/render_logical.py`](../scripts/render_logical.py). 
 
 ```
-scripts/render_logical.py [--section1|--section2] <start> <end> <output.mp4> [engine [samples]]
+scripts/render_logical.py [--section1|--section2] [--overview|--chaseCollector|--chaseBuilder|--combined] <start> <end> <output.mp4> [engine [samples]]
 ```
 
 `[samples]` overrides the render sample count (only valid together with
@@ -18,22 +18,43 @@ file.
 frames trimmed off (it's a single file, so there's no mode1/mode2 cut or
 tail trim to worry about).
 
+`data/section1.blend` has three cameras baked in (see
+`tools/render_site_anim.py` in the AMD-UW pipeline that produced it): the
+overhead `cam_overview`, and two vehicle-following chase cams,
+`cam_chase_a_r1_collector` and `cam_chase_b_r8_builder`. Pick which one
+renders with `--overview`, `--chaseCollector`, or `--chaseBuilder`, or use
+`--combined` (the default whenever `--section1` is used and none of these
+is given explicitly) for overview and chaseCollector side by side, overview
+on the left. `--chaseBuilder` is standalone-only -- it never appears in the
+split screen. These flags only apply to `--section1`; `--section2`'s files
+each have one fixed camera already, so passing a camera flag there fails
+loudly instead of silently doing nothing.
+
 Examples:
 
 ```
 # A clip that crosses the mode1 -> mode2 cut -- the script figures out
 # which frames come from which file and joins them for you.
-scripts/render_logical.py --section2 3500 3700 data/builder/clip.mp4
+scripts/render_logical.py --section2 3600 4200 data/builder/clip.mp4
 
-# A clip from section1
-scripts/render_logical.py --section1 100 300 data/builder/s1_clip.mp4
+# A clip from section1, overview | chaseCollector side by side (the default or can use --combined)
+scripts/render_logical.py --section1 100 105 data/builder/s1_clip.mp4
+
+# Just the overhead camera
+scripts/render_logical.py --section1 --overview 100 105 data/builder/s1_overview.mp4
+
+# Just the collector chase camera
+scripts/render_logical.py --section1 --chaseCollector 100 105 data/builder/s1_chase.mp4
+
+# Just the builder chase camera (never part of --combined)
+scripts/render_logical.py --section1 --chaseBuilder 100 105 data/builder/s1_builder.mp4
 
 # A single frame, as a one-frame video
 scripts/render_logical.py 100 100 data/builder/frame100.mp4
 
 # A single frame, as a still PNG instead -- give it a .png output and the
 # same start/end frame
-scripts/render_logical.py 100 100 data/builder/frame100.png
+scripts/render_logical.py 4200 4200 data/builder/frame100.png
 
 # A frame *range* with a .png output writes a numbered PNG sequence
 # (data/builder/seq/frame_00100.png ... frame_00250.png, numbered by logical
