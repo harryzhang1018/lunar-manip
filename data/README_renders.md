@@ -35,6 +35,12 @@ scripts/render_logical.py 100 100 data/builder/frame100.mp4
 # same start/end frame
 scripts/render_logical.py 100 100 data/builder/frame100.png
 
+# A frame *range* with a .png output writes a numbered PNG sequence
+# (data/builder/seq/frame_00100.png ... frame_00250.png, numbered by logical
+# frame) -- chunks rendered by separate jobs tile into one sequence, which is
+# how the Euler array job (scripts/cluster/render_section2.sh) works
+scripts/render_logical.py 100 250 data/builder/seq/frame.png
+
 # The whole trimmed, combined video (an end past the real last logical
 # frame is clamped automatically)
 scripts/render_logical.py 1 999999 data/builder/full.mp4
@@ -51,11 +57,54 @@ scripts/render_logical.py 1 999999 data/builder/full.mp4 CYCLES 64
 scripts/render_logical.py 1 999999 data/builder/full.mp4 BLENDER_EEVEE 32
 ```
 
+`--section2bg` renders the same section2 timeline (same trims, same logical
+frame numbers) from `section2_mode1_bg.blend` / `section2_mode2_bg.blend`:
+copies of the mode1/mode2 files with two section1 vehicles -- rank_8's M113
+builder (56 m from the camera, far left) and rank_7's Polaris LRV collector
+(drives 60 -> 100 m across the frame), the farthest pair that stays inside
+both section2 cameras' view -- added *with their section1 motion*: in mode1
+they drive / dig for section1's 1975 frames (66 s) then hold their last
+pose, and mode2 starts from that last pose. Each imported vehicle rides a
+keyframed `ground_offset` empty so it stays on section2's terrain (the two
+terrains differ by up to ~2 m along the LRV's path). section1.blend's box
+primitives are drawn at half size by its exporter (trailer bed, tyre
+cylinders, suspension links); they're doubled on import and the tyre boxes
+become `data/vehicle/LRV/meshes/LRVtire_red_m.obj` fitted to the box, the
+way the AMD-UW dataset's own renders do it.
+Those files are produced from the originals by
+[`scripts/add_section1_background.py`](../scripts/add_section1_background.py)
+(see its docstring; re-run it whenever `section2_mode*.blend` changes):
+
+```
+BLENDER=~/blender-5.1.2-linux-x64/blender   # or wherever 5.1.2 lives
+$BLENDER --factory-startup -b data/section2_mode1.blend --python scripts/add_section1_background.py -- --out data/section2_mode1_bg.blend --animate
+$BLENDER --factory-startup -b data/section2_mode2.blend --python scripts/add_section1_background.py -- --out data/section2_mode2_bg.blend --pose-frame 1975
+scripts/render_logical.py --section2bg 800 800 data/builder/frame800.png
+```
+
 The script prints the combined timeline's real total length (from each
 file's own baked frame range, probed and cached in
 `data/.section_frame_range_cache.json`) on every run, so you know the valid
 `<end>` if you don't already.
 
+
+## Rendering on Euler (Slurm array, one GPU per rank)
+
+[`scripts/cluster/render_section2.sh`](../scripts/cluster/render_section2.sh)
+renders a window of the section2 demo as a 15-task array (each task renders
+an equal chunk of frames to PNG through `render_logical.py`; the last task
+to finish encodes them to H.264 with ffmpeg). It works from a hand-made
+workspace (`~/lunar-manip-render` -- Euler has no git-lfs, and its
+`blender/4.0.2` module can't open these 5.1 files, so a Blender 5.1.2 tarball
+lives in `~/Packages`); the script header lists the one-time setup rsyncs.
+
+```
+ssh euler 'cd ~/lunar-manip-render && sbatch scripts/render_section2.sh'                       # 0-60 s, --section2bg
+ssh euler 'cd ~/lunar-manip-render && sbatch --export=ALL,START_SEC=60,END_SEC=120 scripts/render_section2.sh'
+```
+
+Output: `~/lunar-manip-render/renders/section2bg_0-60s/section2bg_0-60s.mp4`
+(+ the PNG frames next to it, ~12 GB per 60 s).
 
 `<output_prefix>` is passed to Blender as `//<output_prefix>` -- Blender's
 `//` means "relative to the .blend file's own location", not your current

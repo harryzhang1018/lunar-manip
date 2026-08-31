@@ -14,14 +14,22 @@ raw per-file frame numbers, trimmed-off frames, or the intermediate
 per-file clips -- only the final joined output.
 
 Usage:
-    scripts/render_logical.py [--section1|--section2] <start> <end> <output.mp4> [engine [samples]]
+    scripts/render_logical.py [--section1|--section2|--section2bg] <start> <end> <output.mp4> [engine [samples]]
 
 --section1 renders data/section1.blend alone (its first 20 frames trimmed,
 no tail trim). --section2 (the default, for backward compatibility) renders
 the combined data/section2_mode1.blend -> data/section2_mode2.blend
-timeline. <start>/<end> are logical frame numbers (1-based, inclusive). A
-single still-frame render is just <start> == <end> -- give it a .png output
-path to get a still image instead of a one-frame video container.
+timeline. --section2bg is the same section2 timeline rendered from
+data/section2_mode{1,2}_bg.blend -- the same files with a few far-away
+section1 vehicles added as background props by
+scripts/add_section1_background.py (same trims, same logical frame numbers).
+
+<start>/<end> are logical frame numbers (1-based, inclusive). A single
+still-frame render is just <start> == <end> -- give it a .png output path to
+get a still image instead of a one-frame video container. A .png output
+with <start> < <end> writes a numbered PNG *sequence* instead
+(<stem>_<logical frame:05d>.png next to the given path), so chunks rendered
+by different jobs tile into one sequence you can encode with ffmpeg.
 
 Examples:
     # A clip crossing the section2 mode1 -> mode2 cut
@@ -35,6 +43,9 @@ Examples:
 
     # One single frame, as a one-frame video instead
     scripts/render_logical.py 100 100 data/builder/frame100.mp4
+
+    # Frames 100-250 as data/builder/seq/frame_00100.png ... frame_00250.png
+    scripts/render_logical.py 100 250 data/builder/seq/frame.png
 
     # The whole trimmed, combined video (an end past the real last logical
     # frame is clamped, so a large round number like this works fine)
@@ -73,18 +84,28 @@ BLENDER = os.environ.get(
 # frames to drop off the end), ...], in logical playback order. See
 # data/README_renders.md for what these trims are covering.
 SECTIONS = {
-    1: [("section1.blend", 20, 0)],
-    2: [
+    "1": [("section1.blend", 20, 0)],
+    "2": [
         ("section2_mode1.blend", 12, 200),
         ("section2_mode2.blend", 193, 50),
+    ],
+    # section2 + background vehicles (scripts/add_section1_background.py);
+    # identical timeline/trims, just different source files
+    "2bg": [
+        ("section2_mode1_bg.blend", 12, 200),
+        ("section2_mode2_bg.blend", 193, 50),
     ],
 }
 
 
 def _load_cache():
     if os.path.exists(CACHE_PATH):
-        with open(CACHE_PATH) as f:
-            return json.load(f)
+        try:
+            with open(CACHE_PATH) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            # e.g. a concurrent render job is mid-write -- just re-probe
+            return {}
     return {}
 
 
@@ -166,9 +187,10 @@ def render_segment(blend_path, file_start, file_end, engine, samples=None, as_pn
     output filename, which we don't control, can't collide across segments
     or across concurrent runs) and return the resulting clip/image path.
 
-    `as_png` renders `file_start` as a single still image (`-F PNG -f`)
-    instead of an `-s`/`-e`/`-a` video range -- only valid when
-    file_start == file_end, which main() enforces before calling this.
+    `as_png` renders PNG(s) instead of a video: a single still image
+    (`-F PNG -f`) when file_start == file_end, else a numbered PNG sequence
+    (`-F PNG -s/-e/-a`) -- in which case a *list* of image paths, in frame
+    order, is returned instead of one path.
 
     `samples` overrides the render sample count on whichever engine ends up
     active (the one just set by `-E`, or the file's own default if `engine`
@@ -192,13 +214,22 @@ def render_segment(blend_path, file_start, file_end, engine, samples=None, as_pn
         # segfaulting Blender during a --background run) -- nothing this
         # pipeline renders depends on any add-on being active.
         base_cmd = [BLENDER, "--factory-startup", "-b", blend_path, *engine_args, *samples_args]
-        if as_png:
+        if as_png and file_start == file_end:
             cmd = base_cmd + ["-o", f"//{out_prefix}", "-F", "PNG", "-f", str(file_start)]
+        elif as_png:
+            cmd = base_cmd + ["-s", str(file_start), "-e", str(file_end),
+                              "-o", f"//{out_prefix}", "-F", "PNG", "-a"]
         else:
             cmd = base_cmd + ["-s", str(file_start), "-e", str(file_end),
                               "-o", f"//{out_prefix}", "-F", "FFMPEG", "-a"]
         subprocess.run(cmd, check=True)
-        clips = glob.glob(os.path.join(tmp_dir, "clip*"))
+        clips = sorted(glob.glob(os.path.join(tmp_dir, "clip*")))
+        if as_png and file_start != file_end:
+            expected = file_end - file_start + 1
+            if len(clips) != expected:
+                raise SystemExit(
+                    f"expected {expected} rendered frames in {tmp_dir}, found {len(clips)}")
+            return clips, tmp_dir
         if len(clips) != 1:
             raise SystemExit(f"expected exactly one rendered output in {tmp_dir}, found {clips}")
         return clips[0], tmp_dir
@@ -225,14 +256,14 @@ def concat_clips(clip_paths, output_path):
 
 def main():
     args = sys.argv[1:]
-    section = 2
-    if args and args[0] in ("--section1", "--section2"):
-        section = int(args[0][len("--section"):])
+    section = "2"
+    if args and args[0] in ("--section1", "--section2", "--section2bg"):
+        section = args[0][len("--section"):]
         args = args[1:]
 
     if len(args) not in (3, 4, 5):
         raise SystemExit(
-            "usage: render_logical.py [--section1|--section2] "
+            "usage: render_logical.py [--section1|--section2|--section2bg] "
             "<start_frame> <end_frame> <output.mp4> [engine [samples]]")
     logical_start = int(args[0])
     logical_end = int(args[1])
@@ -241,10 +272,7 @@ def main():
     samples = int(args[4]) if len(args) == 5 else None
 
     as_png = output_path.lower().endswith(".png")
-    if as_png and logical_start != logical_end:
-        raise SystemExit(
-            "PNG output only supports a single frame -- pass the same value for "
-            "<start> and <end>, or use a .mp4/.mkv output for a range")
+    as_png_seq = as_png and logical_start != logical_end
 
     segments, total = logical_to_segments(section, logical_start, logical_end)
     print(f"combined logical timeline: 1-{total}; rendering "
@@ -254,15 +282,30 @@ def main():
 
     tmp_dirs = []
     clip_paths = []
+    seq_stem = os.path.splitext(output_path)[0]
+    logical_cursor = logical_start
+    n_frames = 0
     try:
         for blend_path, file_start, file_end in segments:
             print(f"  {os.path.basename(blend_path)}: frames {file_start}-{file_end}")
             clip_path, tmp_dir = render_segment(
                 blend_path, file_start, file_end, engine, samples, as_png)
-            clip_paths.append(clip_path)
             tmp_dirs.append(tmp_dir)
+            if as_png_seq:
+                # renumber this segment's frames onto the logical timeline
+                # (a one-frame segment comes back as a single path)
+                if isinstance(clip_path, str):
+                    clip_path = [clip_path]
+                for i, frame_path in enumerate(clip_path):
+                    shutil.move(frame_path, f"{seq_stem}_{logical_cursor + i:05d}.png")
+                logical_cursor += len(clip_path)
+                n_frames += len(clip_path)
+            else:
+                clip_paths.append(clip_path)
 
-        if len(clip_paths) == 1:
+        if as_png_seq:
+            pass
+        elif len(clip_paths) == 1:
             shutil.move(clip_paths[0], output_path)
         else:
             concat_clips(clip_paths, output_path)
@@ -270,7 +313,11 @@ def main():
         for tmp_dir in tmp_dirs:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    print(f"wrote {output_path}")
+    if as_png_seq:
+        print(f"wrote {n_frames} frames {seq_stem}_{logical_start:05d}.png .. "
+              f"{seq_stem}_{logical_end:05d}.png")
+    else:
+        print(f"wrote {output_path}")
 
 
 if __name__ == "__main__":
